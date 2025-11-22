@@ -101,6 +101,12 @@ class VLLMProvider:
         self.timeout = self.config.get("timeout", 300.0)
         self.use_completions = self.config.get("use_completions", True)  # Default to completions API
 
+        # Debug: Log which API will be used
+        logger.info(
+            f"[PROVIDER] VLLMProvider initialized: use_completions={self.use_completions}, "
+            f"model={self.default_model}, base_url={self.base_url}"
+        )
+
     def _truncate_values(self, obj: Any, max_length: int | None = None) -> Any:
         """Recursively truncate string values in nested structures.
 
