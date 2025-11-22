@@ -178,6 +178,19 @@ class VLLMProvider:
             return await self._complete_with_completions_api(request, **kwargs)
         return await self._complete_with_chat_api(request, **kwargs)
 
+    def parse_tool_calls(self, response: ChatResponse) -> list:
+        """Parse tool calls from ChatResponse.
+
+        Args:
+            response: Typed chat response
+
+        Returns:
+            List of tool calls from the response
+        """
+        if not response.tool_calls:
+            return []
+        return response.tool_calls
+
     async def _complete_with_completions_api(self, request: ChatRequest, **kwargs) -> ChatResponse:
         """Handle completion using /v1/completions endpoint.
 
