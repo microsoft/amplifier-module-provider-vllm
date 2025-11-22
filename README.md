@@ -1,21 +1,17 @@
 # amplifier-module-provider-vllm
 
-vLLM provider module for Amplifier - OpenAI-compatible API integration.
+vLLM provider module for Amplifier - Responses API integration for local/self-hosted LLMs.
 
 ## Overview
 
-This provider module integrates vLLM's OpenAI-compatible API server with Amplifier, enabling the use of open-weight models like gpt-oss-20b through both `/v1/completions` and `/v1/chat/completions` endpoints.
+This provider module integrates vLLM's OpenAI-compatible Responses API with Amplifier, enabling the use of open-weight models like gpt-oss-20b with full reasoning and tool calling support.
 
-## Features
-
-- **Completions API support** - Direct prompt completion via `/v1/completions`
-- **Chat API support** - Conversational format via `/v1/chat/completions`
-- **Flexible endpoint selection** - Configure which endpoint to use
-- **Streaming responses** - Token-by-token streaming (future)
-- **Log probabilities** - Access token probabilities for analysis
-- **Debug logging** - Full request/response logging with truncation
-- **Timeout handling** - Configurable API timeouts
-- **Network instances** - Connect to remote vLLM servers
+**Key Features:**
+- **Responses API only** - Optimized for reasoning models (gpt-oss, etc.)
+- **Full reasoning support** - Automatic reasoning block separation
+- **Tool calling** - Complete tool integration via Responses API
+- **No API key required** - Works with local vLLM servers
+- **OpenAI-compatible** - Uses OpenAI SDK under the hood
 
 ## Installation
 
@@ -29,57 +25,72 @@ cd amplifier-module-provider-vllm
 uv pip install -e .
 ```
 
+## vLLM Server Setup
+
+This provider requires a running vLLM server. Example setup:
+
+```bash
+# Start vLLM server (basic)
+vllm serve openai/gpt-oss-20b \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --tensor-parallel-size 2
+
+# For production (recommended - full config in /etc/vllm/model.env)
+sudo systemctl start vllm
+```
+
+**Server requirements:**
+- vLLM version: ≥0.10.1 (tested with 0.10.1.1)
+- Responses API: Automatically available (no special flags needed)
+- Model: Any model compatible with vLLM (gpt-oss, Llama, Qwen, etc.)
+
 ## Configuration
 
-### Basic Configuration
+### Minimal Configuration
 
 ```yaml
 providers:
   - module: provider-vllm
     source: git+https://github.com/microsoft/amplifier-module-provider-vllm@main
     config:
-      base_url: "http://localhost:8000" # Required: vLLM server URL
-      default_model: "openai/gpt-oss-20b"
-      max_tokens: 1024
-      temperature: 0.7
+      base_url: "http://192.168.128.5:8000/v1"  # Your vLLM server
 ```
 
-### Advanced Configuration
+### Full Configuration
 
 ```yaml
 providers:
   - module: provider-vllm
     source: git+https://github.com/microsoft/amplifier-module-provider-vllm@main
     config:
-      # Required
-      base_url: "http://localhost:8000"
+      # Connection
+      base_url: "http://192.168.128.5:8000/v1"  # Required: vLLM server URL
 
       # Model settings
-      default_model: "openai/gpt-oss-20b"
-      max_tokens: 2048
-      temperature: 0.5
+      default_model: "openai/gpt-oss-20b"  # Model name from vLLM
+      max_tokens: 4096                      # Max output tokens
+      temperature: 0.7                      # Sampling temperature
 
-      # Endpoint selection
-      use_completions: true # true = /v1/completions, false = /v1/chat/completions
+      # Reasoning
+      reasoning: "high"                     # Reasoning effort: minimal|low|medium|high
+      reasoning_summary: "detailed"         # Summary verbosity: auto|concise|detailed
 
-      # Authentication (optional - many vLLM instances don't require keys)
-      api_key: "your-api-key" # Defaults to "EMPTY"
+      # Advanced
+      enable_state: false                   # Server-side state (requires vLLM config)
+      truncation: "auto"                    # Automatic context management
+      timeout: 300.0                        # API timeout (seconds)
+      priority: 100                         # Provider selection priority
 
-      # Debug settings
-      debug: true # Enable detailed logging
-      raw_debug: true # Enable ultra-verbose raw API I/O logging
-      debug_truncate_length: 180 # Truncate long strings in debug output
-
-      # Performance
-      timeout: 300.0 # API timeout in seconds (default 5 minutes)
-      priority: 100 # Provider selection priority
+      # Debug
+      debug: true                           # Enable detailed logging
+      raw_debug: false                      # Enable raw API I/O logging
+      debug_truncate_length: 180            # Truncate long debug strings
 ```
 
-## Usage
+## Usage Examples
 
-### With Completions API (Default)
-
-The completions API (`/v1/completions`) provides direct prompt completion:
+### Basic Chat
 
 ```python
 from amplifier_core import AmplifierSession
@@ -91,243 +102,204 @@ config = {
     },
     "providers": [{
         "module": "provider-vllm",
-        "source": "git+https://github.com/microsoft/amplifier-module-provider-vllm@main",
         "config": {
-            "base_url": "http://localhost:8000",
-            "default_model": "openai/gpt-oss-20b",
-            "use_completions": True  # Use completions endpoint
+            "base_url": "http://192.168.128.5:8000/v1",
+            "default_model": "openai/gpt-oss-20b"
         }
     }]
 }
 
 async with AmplifierSession(config=config) as session:
-    response = await session.execute("What is 2+2?")
+    response = await session.execute("Explain quantum computing")
     print(response)
 ```
 
-### With Chat API
-
-The chat API (`/v1/chat/completions`) provides conversational format:
+### With Reasoning
 
 ```python
 config = {
     "providers": [{
         "module": "provider-vllm",
-        "source": "git+https://github.com/microsoft/amplifier-module-provider-vllm@main",
         "config": {
-            "base_url": "http://localhost:8000",
+            "base_url": "http://192.168.128.5:8000/v1",
             "default_model": "openai/gpt-oss-20b",
-            "use_completions": False  # Use chat endpoint
+            "reasoning": "high",  # Enable high-effort reasoning
+            "reasoning_summary": "detailed"
         }
-    }]
+    }],
+    # ... rest of config
+}
+
+async with AmplifierSession(config=config) as session:
+    # Model will show internal reasoning before answering
+    response = await session.execute("Solve this complex problem...")
+```
+
+### With Tool Calling
+
+```python
+config = {
+    "providers": [{
+        "module": "provider-vllm",
+        "config": {
+            "base_url": "http://192.168.128.5:8000/v1",
+            "default_model": "openai/gpt-oss-20b"
+        }
+    }],
+    "tools": [{
+        "module": "tool-bash",  # Enable bash tool
+        "config": {}
+    }],
+    # ... rest of config
+}
+
+async with AmplifierSession(config=config) as session:
+    # Model can call tools autonomously
+    response = await session.execute("List the files in the current directory")
+```
+
+## Architecture
+
+This provider uses the **OpenAI SDK** with a custom `base_url` pointing to your vLLM server. Since vLLM implements the OpenAI-compatible Responses API, the integration is clean and direct.
+
+**Key components:**
+- `VLLMProvider`: Main provider class (handles Responses API calls)
+- `_constants.py`: Configuration defaults and metadata keys
+- `_response_handling.py`: Response parsing and content block conversion
+
+**Response flow:**
+```
+ChatRequest → VLLMProvider.complete() → AsyncOpenAI.responses.create() →
+→ vLLM Server → Response → Content blocks (Thinking + Text + ToolCall) → ChatResponse
+```
+
+## Responses API Details
+
+The vLLM provider uses the **Responses API** (`/v1/responses`) which provides:
+
+1. **Structured reasoning**: Separate reasoning blocks from response text
+2. **Tool calling**: Native function calling support
+3. **Conversation state**: Built-in multi-turn conversation handling
+4. **Automatic continuation**: Handles incomplete responses transparently
+
+**Tool format** (vLLM Responses API):
+```json
+{
+  "type": "function",
+  "name": "tool_name",
+  "description": "Tool description",
+  "parameters": {"type": "object", "properties": {...}}
 }
 ```
 
-### With Log Probabilities
-
-```python
-# Pass logprobs parameter via kwargs
-response = await session.execute(
-    "The capital of France is",
-    logprobs=1  # Show top 1 logprob for each token
-)
+**Response structure:**
+```json
+{
+  "output": [
+    {"type": "reasoning", "content": [{"type": "reasoning_text", "text": "..."}]},
+    {"type": "function_call", "name": "tool_name", "arguments": "{...}"},
+    {"type": "message", "content": [{"type": "output_text", "text": "..."}]}
+  ]
+}
 ```
-
-## API Endpoints
-
-### Completions Endpoint (`/v1/completions`)
-
-**When to use:**
-
-- Direct prompt completion
-- No conversation history needed
-- Maximum control over prompt format
-- Legacy compatibility
-
-**Parameters:**
-
-- `model` - Model name (e.g., "openai/gpt-oss-20b")
-- `prompt` - Input text to complete
-- `max_tokens` - Maximum tokens to generate
-- `temperature` - Sampling temperature (0-2)
-- `logprobs` - Number of top logprobs to return
-- `echo` - Echo prompt in response
-- `stop` - Stop sequences
-
-### Chat Endpoint (`/v1/chat/completions`)
-
-**When to use:**
-
-- Conversational interactions
-- Multi-turn dialogues
-- Structured message format
-- gpt-oss models (includes reasoning_content)
-
-**Parameters:**
-
-- `model` - Model name
-- `messages` - List of message objects
-- `max_tokens` - Maximum tokens to generate
-- `temperature` - Sampling temperature
-
-## vLLM Server Setup
-
-### Starting vLLM Server
-
-```bash
-# Install vLLM with gpt-oss support
-uv pip install --pre vllm==0.10.1+gptoss \
-    --extra-index-url https://wheels.vllm.ai/gpt-oss/ \
-    --extra-index-url https://download.pytorch.org/whl/nightly/cu128 \
-    --index-strategy unsafe-best-match
-
-# Start server (network-accessible)
-vllm serve openai/gpt-oss-20b \
-    --host 0.0.0.0 \
-    --port 8000 \
-    --api-key your-secret-key  # Optional
-```
-
-### Verifying Server
-
-```bash
-# Check available models
-curl http://localhost:8000/v1/models
-
-# Test completions endpoint
-curl http://localhost:8000/v1/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "openai/gpt-oss-20b",
-    "prompt": "What is 2+2?",
-    "max_tokens": 50
-  }'
-```
-
-## Network Configuration
-
-### Firewall Rules
-
-Ensure port 8000 (or your chosen port) is accessible:
-
-```bash
-# Check if port is open
-nc -zv localhost 8000
-
-# If using firewall
-sudo ufw allow 8000/tcp
-```
-
-### Security
-
-For production deployments:
-
-1. **Use API keys**: Set `--api-key` on server, provide in config
-2. **Use HTTPS**: Place behind reverse proxy (nginx, traefik)
-3. **Rate limiting**: Add rate limiting at proxy level
-4. **Network isolation**: Use VPN or internal network
 
 ## Debugging
 
-### Enable Debug Logging
+Enable debug logging to see full request/response details:
 
 ```yaml
 config:
-  debug: true # Summary logging
-  raw_debug: true # Full API I/O
+  debug: true        # Summary logging
+  raw_debug: true    # Complete API I/O
 ```
 
-### Check Session Logs
-
+**Check logs:**
 ```bash
-# Find recent session logs
+# Find recent session
 ls -lt ~/.amplifier/projects/*/sessions/*/events.jsonl | head -1
 
-# View vLLM request
-grep '"provider":"vllm"' <log-file> | grep request
+# View raw requests
+grep '"event":"llm:request:raw"' <log-file> | python3 -m json.tool
 
-# View vLLM response
-grep '"provider":"vllm"' <log-file> | grep response
+# View raw responses
+grep '"event":"llm:response:raw"' <log-file> | python3 -m json.tool
 ```
-
-## Model Support
-
-Tested models:
-
-- ✅ **gpt-oss-20b** - 20B parameter model, MXFP4 quantized
-- ✅ **gpt-oss-120b** - 120B parameter model (requires more VRAM)
-
-Other vLLM-compatible models should work but may require prompt format adjustments.
 
 ## Troubleshooting
 
-### "No base_url found"
+### Connection refused
 
-**Cause**: Missing required `base_url` configuration
-
-**Solution**: Add `base_url` to provider config:
-
-```yaml
-config:
-  base_url: "http://localhost:8000"
-```
-
-### Connection Refused
-
-**Cause**: vLLM server not running or firewall blocking
+**Problem**: Cannot connect to vLLM server
 
 **Solution**:
+```bash
+# Check vLLM service status
+sudo systemctl status vllm
 
-1. Verify server is running: `curl http://localhost:8000/health`
-2. Check firewall rules
-3. Verify server started with `--host 0.0.0.0`
+# Verify server is listening
+curl http://192.168.128.5:8000/health
 
-### API Timeout
-
-**Cause**: Response took longer than timeout setting
-
-**Solution**: Increase timeout in config:
-
-```yaml
-config:
-  timeout: 600.0 # 10 minutes
+# Check logs
+sudo journalctl -u vllm -n 50
 ```
 
-## Performance
+### Tool calling not working
 
-### gpt-oss-20b Requirements
+**Problem**: Model responds with text instead of calling tools
 
-- **VRAM**: ~16GB
-- **GPU**: NVIDIA Blackwell/Hopper or AMD MI300x/MI355x
-- **Model size**: ~14GB on disk (MXFP4 quantized)
+**Verification**:
+- ✅ vLLM version ≥0.10.1
+- ✅ Using Responses API (not Chat Completions)
+- ✅ Tools defined in request
 
-### Expected Latency
+**Note**: Tool calling works via Responses API without special vLLM flags. If it's not working, check the model supports tool calling.
 
-- First token: 50-200ms
-- Subsequent tokens: 20-50ms each
-- Full response (100 tokens): 2-5 seconds
+### No reasoning blocks
+
+**Problem**: Responses don't include reasoning/thinking
+
+**Check**:
+- Is `reasoning` parameter set in config? (`minimal|low|medium|high`)
+- Is the model a reasoning model? (gpt-oss supports reasoning)
+- Check raw debug logs to see if reasoning is in API response
+
+## Development
+
+```bash
+# Clone and install
+git clone https://github.com/microsoft/amplifier-module-provider-vllm
+cd amplifier-module-provider-vllm
+uv pip install -e .
+
+# Run tests
+pytest tests/
+
+# Check types and lint
+make check
+```
+
+## Testing
+
+See `ai_working/vllm-investigation/` for comprehensive test scripts:
+
+- `test_provider_simple.py` - Basic provider functionality test
+- `06_test_responses_correct_format.py` - Responses API format validation
+- `04_test_tool_calling.py` - Tool calling verification
+
+## License
+
+MIT
 
 ## Contributing
 
-> [!NOTE]
-> This project is not currently accepting external contributions, but we're actively working toward opening this up. We value community input and look forward to collaborating in the future. For now, feel free to fork and experiment!
-
-Most contributions require you to agree to a
+This project welcomes contributions and suggestions. Most contributions require you to agree to a
 Contributor License Agreement (CLA) declaring that you have the right to, and actually do, grant us
-the rights to use your contribution. For details, visit [Contributor License Agreements](https://cla.opensource.microsoft.com).
-
-When you submit a pull request, a CLA bot will automatically determine whether you need to provide
-a CLA and decorate the PR appropriately (e.g., status check, comment). Simply follow the instructions
-provided by the bot. You will only need to do this once across all repos using our CLA.
-
-This project has adopted the [Microsoft Open Source Code of Conduct](https://opensource.microsoft.com/codeofconduct/).
-For more information see the [Code of Conduct FAQ](https://opensource.microsoft.com/codeofconduct/faq/) or
-contact [opencode@microsoft.com](mailto:opencode@microsoft.com) with any additional questions or comments.
+the rights to use your contribution. For details, visit https://cla.opensource.microsoft.com.
 
 ## Trademarks
 
 This project may contain trademarks or logos for projects, products, or services. Authorized use of Microsoft
 trademarks or logos is subject to and must follow
-[Microsoft's Trademark & Brand Guidelines](https://www.microsoft.com/legal/intellectualproperty/trademarks/usage/general).
+[Microsoft's Trademark & Brand Guidelines](https://www.microsoft.com/en-us/legal/intellectualproperty/trademarks/usage/general).
 Use of Microsoft trademarks or logos in modified versions of this project must not cause confusion or imply Microsoft sponsorship.
 Any use of third-party trademarks or logos are subject to those third-party's policies.
