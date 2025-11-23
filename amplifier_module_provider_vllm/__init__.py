@@ -355,12 +355,6 @@ class VLLMProvider:
         for conv_msg in conversation:
             all_messages_for_conversion.append(conv_msg.model_dump())
 
-        # Convert to OpenAI Responses API message format
-        input_messages = self._convert_messages(all_messages_for_conversion)
-        logger.info(
-            f"[PROVIDER] Converted {len(all_messages_for_conversion)} messages to {len(input_messages)} API messages"
-        )
-
         # Check for previous response metadata to preserve reasoning state across turns
         previous_response_id = None
         if message_list:
@@ -380,28 +374,38 @@ class VLLMProvider:
                             )
                             break
 
-        # Prepare request parameters per Responses API spec
+        # vLLM Responses API expects input as STRING (last user message only)
+        # For stateful conversations, previous context accessed via previous_response_id
+        last_user_message = self._extract_last_user_message(all_messages_for_conversion)
+        logger.info(f"[PROVIDER] Extracted last user message ({len(last_user_message)} chars) for Responses API")
+
+        # Prepare request parameters per vLLM Responses API spec
         params = {
             "model": kwargs.get("model", self.default_model),
-            "input": input_messages,  # Array of message objects, not text string
+            "input": last_user_message,  # String (last user message only)
         }
 
         # Determine store parameter early (needed for previous_response_id logic)
         store_enabled = kwargs.get("store", self.enable_state)
         params["store"] = store_enabled
 
-        # Add previous_response_id ONLY if store is enabled (server-side state)
-        # With store=False, we rely on explicit reasoning re-insertion instead
+        # Handle conversation history based on store mode
         if previous_response_id and store_enabled:
+            # Stateful mode: Use previous_response_id for conversation continuity
             params["previous_response_id"] = previous_response_id
             logger.debug("[PROVIDER] Using previous_response_id (store=True)")
-        elif previous_response_id and not store_enabled:
-            logger.debug(
-                "[PROVIDER] Skipping previous_response_id (store=False). "
-                "Relying on explicit reasoning re-insertion from metadata/content."
-            )
-
-        if instructions:
+        elif len(all_messages_for_conversion) > 1 and not store_enabled:
+            # Stateless mode: Encode conversation history in instructions
+            # This provides context without requiring server-side state storage
+            history_context = self._build_conversation_history_context(all_messages_for_conversion)
+            if history_context:
+                base_instructions = instructions or ""
+                params["instructions"] = f"{base_instructions}\n\n{history_context}".strip()
+                logger.debug(
+                    f"[PROVIDER] Using stateless mode - encoded {len(all_messages_for_conversion)} messages "
+                    f"in instructions ({len(history_context)} chars)"
+                )
+        elif instructions:
             params["instructions"] = instructions
 
         if request.max_output_tokens:
@@ -574,7 +578,7 @@ class VLLMProvider:
                 # Build continuation params using input-based pattern (stateless-compatible)
                 # Instead of previous_response_id (requires store:true), we include the
                 # accumulated output in the input to preserve context
-                continuation_input = self._build_continuation_input(input_messages, accumulated_output)
+                continuation_input = self._build_continuation_input(all_messages_for_conversion, accumulated_output)
 
                 continue_params = {
                     "model": params["model"],
@@ -710,6 +714,109 @@ class VLLMProvider:
                     },
                 )
             raise
+
+    def _build_conversation_history_context(self, messages: list[dict[str, Any]]) -> str:
+        """Build conversation history as text for stateless mode.
+
+        When server-side state is not available, we encode the conversation history
+        in the instructions parameter to provide context. This excludes the last
+        user message (which is sent as the 'input' parameter).
+
+        Args:
+            messages: List of message dicts from ChatRequest
+
+        Returns:
+            Formatted conversation history as string
+        """
+        history_lines = ["Previous conversation:"]
+
+        # Process all but the last user message
+        for i, msg in enumerate(messages):
+            role = msg.get("role")
+            content = msg.get("content", "")
+
+            # Skip the last message (it's sent as 'input')
+            if i == len(messages) - 1 and role == "user":
+                continue
+
+            # Format based on role
+            if role == "user":
+                # Extract text from user messages
+                if isinstance(content, list):
+                    text_parts = []
+                    for block in content:
+                        if isinstance(block, dict):
+                            if block.get("type") in ("text", "input_text"):
+                                text_parts.append(block.get("text", ""))
+                        elif hasattr(block, "type") and block.type == "text":
+                            text_parts.append(getattr(block, "text", ""))
+                    text = "\n".join(text_parts) if text_parts else ""
+                else:
+                    text = content
+
+                if text:
+                    history_lines.append(f"User: {text}")
+
+            elif role == "assistant":
+                # Extract text from assistant messages
+                if isinstance(content, list):
+                    text_parts = []
+                    for block in content:
+                        if isinstance(block, dict):
+                            if block.get("type") == "text":
+                                text_parts.append(block.get("text", ""))
+                        elif hasattr(block, "type") and block.type == "text":
+                            text_parts.append(getattr(block, "text", ""))
+                    text = "\n".join(text_parts) if text_parts else ""
+                else:
+                    text = content
+
+                if text:
+                    history_lines.append(f"Assistant: {text}")
+
+        # Only return history if we have more than just the header
+        if len(history_lines) > 1:
+            return "\n".join(history_lines)
+        return ""
+
+    def _extract_last_user_message(self, messages: list[dict[str, Any]]) -> str:
+        """Extract the last user message as a string for vLLM Responses API.
+
+        vLLM's Responses API expects 'input' parameter as a plain string containing
+        only the current user message. Previous conversation context is accessed
+        via previous_response_id when server-side state is enabled.
+
+        Args:
+            messages: List of message dicts from ChatRequest
+
+        Returns:
+            String containing the last user message content
+        """
+        # Find last user message (iterate backwards)
+        for msg in reversed(messages):
+            role = msg.get("role")
+            if role == "user":
+                content = msg.get("content", "")
+
+                # Handle structured content (list of blocks)
+                if isinstance(content, list):
+                    # Extract text from content blocks
+                    text_parts = []
+                    for block in content:
+                        if isinstance(block, dict):
+                            if block.get("type") in ("text", "input_text"):
+                                text_parts.append(block.get("text", ""))
+                        elif hasattr(block, "type") and block.type == "text":
+                            text_parts.append(getattr(block, "text", ""))
+                    return "\n".join(text_parts) if text_parts else ""
+
+                # Handle simple string content
+                if isinstance(content, str):
+                    return content
+
+        # No user message found - return empty string (will likely cause API error)
+        logger.warning("[PROVIDER] No user message found in conversation - returning empty input")
+        return ""
 
     def _convert_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Convert messages to vLLM Responses API format (OpenAI-compatible).
