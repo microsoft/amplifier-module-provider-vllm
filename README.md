@@ -25,6 +25,8 @@ cd amplifier-module-provider-vllm
 uv pip install -e .
 ```
 
+**Note for GPT-OSS models**: Token accounting requires vocab files that are automatically downloaded to `~/.amplifier/vocab/` on first use (requires internet access). If working offline, see troubleshooting section for manual setup.
+
 ## vLLM Server Setup
 
 This provider requires a running vLLM server. Example setup:
@@ -262,6 +264,43 @@ sudo journalctl -u vllm -n 50
 - Is `reasoning` parameter set in config? (`minimal|low|medium|high`)
 - Is the model a reasoning model? (gpt-oss supports reasoning)
 - Check raw debug logs to see if reasoning is in API response
+
+### Token usage shows zeros
+
+**For GPT-OSS models**: Token accounting is automatic but requires vocab files.
+
+**How it works**:
+- First use: Automatically downloads vocab files to `~/.amplifier/vocab/`
+- Subsequent uses: Uses cached files
+- No manual setup needed if you have internet access
+
+**What's computed**:
+- **Input tokens**: Accurate count using Harmony's tokenization (matches model training format)
+- **Output tokens**: Approximate count based on visible output text
+- **Limitation**: Output count doesn't include hidden reasoning channels (REST API limitation)
+
+**If auto-download fails** (offline/air-gapped):
+
+```bash
+# Manual setup for offline environments
+mkdir -p ~/.amplifier/vocab
+
+# Download vocab files (on a machine with internet)
+curl -sS -o ~/.amplifier/vocab/o200k_base.tiktoken \
+  https://openaipublic.blob.core.windows.net/encodings/o200k_base.tiktoken
+
+curl -sS -o ~/.amplifier/vocab/cl100k_base.tiktoken \
+  https://openaipublic.blob.core.windows.net/encodings/cl100k_base.tiktoken
+
+# Transfer ~/.amplifier/vocab/ directory to offline machine
+# Then set environment variable:
+export TIKTOKEN_ENCODINGS_BASE=~/.amplifier/vocab
+```
+
+**Check logs for**:
+- `[TOKEN_ACCOUNTING] Downloaded vocab files...` (first use)
+- `[TOKEN_ACCOUNTING] Loaded Harmony GPT-OSS encoder` (success)
+- `[TOKEN_ACCOUNTING] Injected usage: input=X, output=Y` (active)
 
 ## Development
 

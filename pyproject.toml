@@ -10,6 +10,7 @@ authors = [
 ]
 dependencies = [
     "openai>=1.0.0",
+    "openai-harmony>=0.0.8",
 ]
 
 [project.entry-points."amplifier.modules"]

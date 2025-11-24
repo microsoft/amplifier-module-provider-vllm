@@ -35,6 +35,8 @@ from ._constants import METADATA_INCOMPLETE_REASON
 from ._constants import METADATA_RESPONSE_ID
 from ._constants import METADATA_STATUS
 from ._response_handling import convert_response_with_accumulated_output
+from ._token_accounting import apply_token_accounting
+from ._token_accounting import should_apply_token_accounting
 
 logger = logging.getLogger(__name__)
 
@@ -515,6 +517,10 @@ class VLLMProvider:
         try:
             response = await asyncio.wait_for(self.client.responses.create(**params), timeout=self.timeout)
             elapsed_ms = int((time.time() - start_time) * 1000)
+
+            # Apply token accounting for GPT-OSS models (vLLM bug returns zeros)
+            if should_apply_token_accounting(params["model"]):
+                response = apply_token_accounting(params, response)
 
             logger.info("[PROVIDER] Received response from %s API", self.api_label)
 
