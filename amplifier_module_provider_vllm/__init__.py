@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import time
+import uuid
 from typing import Any
 from typing import cast
 
@@ -31,11 +32,9 @@ from ._constants import DEFAULT_TRUNCATION
 from ._constants import MAX_CONTINUATION_ATTEMPTS
 from ._constants import METADATA_CONTINUATION_COUNT
 from ._constants import METADATA_INCOMPLETE_REASON
-from ._constants import METADATA_REASONING_ITEMS
 from ._constants import METADATA_RESPONSE_ID
 from ._constants import METADATA_STATUS
 from ._response_handling import convert_response_with_accumulated_output
-from ._response_handling import extract_reasoning_text
 
 logger = logging.getLogger(__name__)
 
@@ -374,38 +373,35 @@ class VLLMProvider:
                             )
                             break
 
-        # vLLM Responses API expects input as STRING (last user message only)
-        # For stateful conversations, previous context accessed via previous_response_id
-        last_user_message = self._extract_last_user_message(all_messages_for_conversion)
-        logger.info(f"[PROVIDER] Extracted last user message ({len(last_user_message)} chars) for Responses API")
+        # Convert to vLLM Responses API message format (array of message objects)
+        input_messages = self._convert_messages(all_messages_for_conversion)
+        logger.info(
+            f"[PROVIDER] Converted {len(all_messages_for_conversion)} messages to {len(input_messages)} API messages"
+        )
 
         # Prepare request parameters per vLLM Responses API spec
         params = {
             "model": kwargs.get("model", self.default_model),
-            "input": last_user_message,  # String (last user message only)
+            "input": input_messages,  # Array of message objects, same as OpenAI
         }
 
         # Determine store parameter early (needed for previous_response_id logic)
         store_enabled = kwargs.get("store", self.enable_state)
         params["store"] = store_enabled
 
-        # Handle conversation history based on store mode
+        # Add previous_response_id ONLY if store is enabled (server-side state)
+        # With store=False, we rely on explicit reasoning re-insertion instead
         if previous_response_id and store_enabled:
-            # Stateful mode: Use previous_response_id for conversation continuity
             params["previous_response_id"] = previous_response_id
             logger.debug("[PROVIDER] Using previous_response_id (store=True)")
-        elif len(all_messages_for_conversion) > 1 and not store_enabled:
-            # Stateless mode: Encode conversation history in instructions
-            # This provides context without requiring server-side state storage
-            history_context = self._build_conversation_history_context(all_messages_for_conversion)
-            if history_context:
-                base_instructions = instructions or ""
-                params["instructions"] = f"{base_instructions}\n\n{history_context}".strip()
-                logger.debug(
-                    f"[PROVIDER] Using stateless mode - encoded {len(all_messages_for_conversion)} messages "
-                    f"in instructions ({len(history_context)} chars)"
-                )
-        elif instructions:
+        elif previous_response_id and not store_enabled:
+            logger.debug(
+                "[PROVIDER] Skipping previous_response_id (store=False). "
+                "Relying on explicit reasoning re-insertion from metadata/content."
+            )
+
+        # Add instructions if provided
+        if instructions:
             params["instructions"] = instructions
 
         if request.max_output_tokens:
@@ -715,122 +711,49 @@ class VLLMProvider:
                 )
             raise
 
-    def _build_conversation_history_context(self, messages: list[dict[str, Any]]) -> str:
-        """Build conversation history as text for stateless mode.
-
-        When server-side state is not available, we encode the conversation history
-        in the instructions parameter to provide context. This excludes the last
-        user message (which is sent as the 'input' parameter).
+    def _extract_text_from_content(self, content: Any) -> str:
+        """Extract plain text from content (handles both string and structured formats).
 
         Args:
-            messages: List of message dicts from ChatRequest
+            content: Content value (string or list of content blocks)
 
         Returns:
-            Formatted conversation history as string
+            Plain text string
         """
-        history_lines = ["Previous conversation:"]
+        if isinstance(content, str):
+            return content
 
-        # Process all but the last user message
-        for i, msg in enumerate(messages):
-            role = msg.get("role")
-            content = msg.get("content", "")
+        if isinstance(content, list):
+            text_parts = []
+            for block in content:
+                if isinstance(block, dict):
+                    # Extract text from various block types
+                    if block.get("type") in ("text", "input_text", "output_text"):
+                        text_parts.append(block.get("text", ""))
+                elif (
+                    hasattr(block, "type")
+                    and hasattr(block, "text")
+                    and block.type in ("text", "input_text", "output_text")
+                ):
+                    # Handle ContentBlock objects
+                    text_parts.append(block.text)
+            return "\n".join(text_parts) if text_parts else ""
 
-            # Skip the last message (it's sent as 'input')
-            if i == len(messages) - 1 and role == "user":
-                continue
-
-            # Format based on role
-            if role == "user":
-                # Extract text from user messages
-                if isinstance(content, list):
-                    text_parts = []
-                    for block in content:
-                        if isinstance(block, dict):
-                            if block.get("type") in ("text", "input_text"):
-                                text_parts.append(block.get("text", ""))
-                        elif hasattr(block, "type") and block.type == "text":
-                            text_parts.append(getattr(block, "text", ""))
-                    text = "\n".join(text_parts) if text_parts else ""
-                else:
-                    text = content
-
-                if text:
-                    history_lines.append(f"User: {text}")
-
-            elif role == "assistant":
-                # Extract text from assistant messages
-                if isinstance(content, list):
-                    text_parts = []
-                    for block in content:
-                        if isinstance(block, dict):
-                            if block.get("type") == "text":
-                                text_parts.append(block.get("text", ""))
-                        elif hasattr(block, "type") and block.type == "text":
-                            text_parts.append(getattr(block, "text", ""))
-                    text = "\n".join(text_parts) if text_parts else ""
-                else:
-                    text = content
-
-                if text:
-                    history_lines.append(f"Assistant: {text}")
-
-        # Only return history if we have more than just the header
-        if len(history_lines) > 1:
-            return "\n".join(history_lines)
-        return ""
-
-    def _extract_last_user_message(self, messages: list[dict[str, Any]]) -> str:
-        """Extract the last user message as a string for vLLM Responses API.
-
-        vLLM's Responses API expects 'input' parameter as a plain string containing
-        only the current user message. Previous conversation context is accessed
-        via previous_response_id when server-side state is enabled.
-
-        Args:
-            messages: List of message dicts from ChatRequest
-
-        Returns:
-            String containing the last user message content
-        """
-        # Find last user message (iterate backwards)
-        for msg in reversed(messages):
-            role = msg.get("role")
-            if role == "user":
-                content = msg.get("content", "")
-
-                # Handle structured content (list of blocks)
-                if isinstance(content, list):
-                    # Extract text from content blocks
-                    text_parts = []
-                    for block in content:
-                        if isinstance(block, dict):
-                            if block.get("type") in ("text", "input_text"):
-                                text_parts.append(block.get("text", ""))
-                        elif hasattr(block, "type") and block.type == "text":
-                            text_parts.append(getattr(block, "text", ""))
-                    return "\n".join(text_parts) if text_parts else ""
-
-                # Handle simple string content
-                if isinstance(content, str):
-                    return content
-
-        # No user message found - return empty string (will likely cause API error)
-        logger.warning("[PROVIDER] No user message found in conversation - returning empty input")
-        return ""
+        return str(content) if content else ""
 
     def _convert_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Convert messages to vLLM Responses API format (OpenAI-compatible).
 
         Handles:
-        - User messages: Simple text content
-        - Assistant messages: Reconstructs with tool calls if present
-        - Tool messages: Converts to appropriate format
+        - User messages: Simple string content
+        - Assistant messages: Simple string content with tool calls if present
+        - Tool messages: Converts to text format
 
         Args:
             messages: List of message dicts from ChatRequest
 
         Returns:
-            List of vLLM-formatted message objects per Responses API spec
+            List of vLLM-formatted message objects with simple string content
         """
         openai_messages = []
         i = 0
@@ -848,7 +771,6 @@ class VLLMProvider:
             # Handle tool result messages
             if role == "tool":
                 # For OpenAI Responses API, convert tool results to text
-                # API doesn't support tool_result content type - use input_text
                 tool_results_parts = []
                 while i < len(messages) and messages[i].get("role") == "tool":
                     tool_msg = messages[i]
@@ -859,17 +781,16 @@ class VLLMProvider:
                     tool_results_parts.append(f"[Tool: {tool_name}]\n{tool_content}")
                     i += 1
 
-                # Add as user message with combined tool results as text
+                # Add as user message with combined tool results as simple string
                 if tool_results_parts:
                     combined_text = "\n\n".join(tool_results_parts)
-                    openai_messages.append({"role": "user", "content": [{"type": "input_text", "text": combined_text}]})
+                    openai_messages.append({"role": "user", "content": combined_text})
                 continue
 
             # Handle assistant messages
             if role == "assistant":
-                assistant_content = []
-                reasoning_items_to_add = []  # Top-level reasoning items (not in message content)
-                metadata = msg.get("metadata", {})
+                reasoning_items_to_add = []  # Top-level reasoning items (before assistant message)
+                text_parts = []  # Accumulate text for simple string content
 
                 # Handle structured content (list of blocks)
                 if isinstance(content, list):
@@ -878,96 +799,76 @@ class VLLMProvider:
                         if isinstance(block, dict):
                             block_type = block.get("type")
                             if block_type == "text":
-                                assistant_content.append({"type": "output_text", "text": block.get("text", "")})
+                                text_parts.append(block.get("text", ""))
                             elif block_type == "thinking":
-                                # Extract reasoning state for top-level insertion
-                                # Reasoning items must be top-level in input, not in message content!
-                                block_content = block.get("content")
-                                if block_content and len(block_content) >= 2:
-                                    encrypted_content = block_content[0]
-                                    reasoning_id = block_content[1]
-                                    if reasoning_id:
-                                        reasoning_item = {"type": "reasoning", "id": reasoning_id}
-                                        if encrypted_content:
-                                            reasoning_item["encrypted_content"] = encrypted_content
-                                        # Add summary from thinking text
-                                        if block.get("thinking"):
-                                            reasoning_item["summary"] = [
-                                                {"type": "summary_text", "text": block["thinking"]}
-                                            ]
-                                        reasoning_items_to_add.append(reasoning_item)
+                                # Extract reasoning text for re-insertion
+                                thinking_text = block.get("thinking", "")
+                                if thinking_text:
+                                    # Create reasoning item with both summary and content (vLLM requires both)
+                                    reasoning_item = {
+                                        "type": "reasoning",  # Required: must be "reasoning"
+                                        "id": f"local_{uuid.uuid4().hex[:16]}",  # Required: unique ID
+                                        "summary": [  # Required: summary array
+                                            {"type": "summary_text", "text": thinking_text}
+                                        ],
+                                        "content": [  # Required: reasoning text content
+                                            {"type": "reasoning_text", "text": thinking_text}
+                                        ],
+                                    }
+                                    reasoning_items_to_add.append(reasoning_item)
                         elif hasattr(block, "type"):
                             # Handle ContentBlock objects (TextBlock, ThinkingBlock, etc.)
                             if block.type == "text":
-                                assistant_content.append({"type": "output_text", "text": block.text})
-                            elif (
-                                block.type == "thinking"
-                                and hasattr(block, "content")
-                                and block.content
-                                and len(block.content) >= 2
-                            ):
-                                # Extract reasoning state for top-level insertion
-                                # Reasoning items must be top-level in input, not in message content!
-                                encrypted_content = block.content[0]
-                                reasoning_id = block.content[1]
-
-                                if reasoning_id:  # Only include if we have a reasoning ID
-                                    reasoning_item = {"type": "reasoning", "id": reasoning_id}
-
-                                    # Add encrypted content if available
-                                    if encrypted_content:
-                                        reasoning_item["encrypted_content"] = encrypted_content
-
-                                    # Add summary from thinking text
-                                    if hasattr(block, "thinking") and block.thinking:
-                                        reasoning_item["summary"] = [{"type": "summary_text", "text": block.thinking}]
-
+                                text_parts.append(block.text)
+                            elif block.type == "thinking" and hasattr(block, "thinking"):
+                                # Extract reasoning text for re-insertion
+                                thinking_text = block.thinking
+                                if thinking_text:
+                                    # Create reasoning item with both summary and content (vLLM requires both)
+                                    reasoning_item = {
+                                        "type": "reasoning",  # Required: must be "reasoning"
+                                        "id": f"local_{uuid.uuid4().hex[:16]}",  # Required: unique ID
+                                        "summary": [  # Required: summary array
+                                            {"type": "summary_text", "text": thinking_text}
+                                        ],
+                                        "content": [  # Required: reasoning text content
+                                            {"type": "reasoning_text", "text": thinking_text}
+                                        ],
+                                    }
                                     reasoning_items_to_add.append(reasoning_item)
-
                 # Handle simple string content
                 elif isinstance(content, str) and content:
-                    assistant_content.append({"type": "output_text", "text": content})
-
-                # FALLBACK: If no reasoning items in content but metadata has them, log for visibility
-                # (Cannot reconstruct without encrypted_content, so previous_response_id is the fallback)
-                if metadata and metadata.get(METADATA_REASONING_ITEMS):
-                    has_reasoning_in_content = any(
-                        (isinstance(item, dict) and item.get("type") == "reasoning")
-                        or (hasattr(item, "get") and item.get("type") == "reasoning")
-                        for item in assistant_content
-                    )
-                    if not has_reasoning_in_content:
-                        logger.debug(
-                            "[PROVIDER] Reasoning IDs in metadata but not in content blocks. "
-                            "Using previous_response_id fallback for reasoning preservation. "
-                            "Consider updating orchestrator to preserve content blocks for optimal reasoning re-insertion."
-                        )
+                    text_parts.append(content)
 
                 # Add reasoning items as TOP-LEVEL entries (before assistant message)
-                # Per OpenAI Responses API: reasoning items must be top-level, not in message content
                 for reasoning_item in reasoning_items_to_add:
                     openai_messages.append(reasoning_item)
+                    logger.debug(
+                        f"[PROVIDER] Added reasoning item: id={reasoning_item['id']}, "
+                        f"summary_len={len(reasoning_item['summary'][0]['text'])} chars, "
+                        f"content_len={len(reasoning_item['content'][0]['text'])} chars"
+                    )
 
-                # Only add assistant message if there's content
-                if assistant_content:
-                    openai_messages.append({"role": "assistant", "content": assistant_content})
+                # Only add assistant message if there's text content
+                if text_parts:
+                    combined_text = "\n".join(text_parts)
+                    openai_messages.append({"role": "assistant", "content": combined_text})
 
                 i += 1
 
             # Handle developer messages as XML-wrapped user messages
             elif role == "developer":
-                wrapped = f"<context_file>\n{content}\n</context_file>"
-                openai_messages.append({"role": "user", "content": [{"type": "input_text", "text": wrapped}]})
+                text_content = self._extract_text_from_content(content)
+                wrapped = f"<context_file>\n{text_content}\n</context_file>"
+                openai_messages.append({"role": "user", "content": wrapped})
                 i += 1
 
             # Handle user messages
             elif role == "user":
-                openai_messages.append(
-                    {
-                        "role": "user",
-                        "content": [{"type": "input_text", "text": content}] if isinstance(content, str) else content,
-                    }
-                )
+                # Extract text content as simple string
+                text_content = self._extract_text_from_content(content)
+                if text_content:
+                    openai_messages.append({"role": "user", "content": text_content})
                 i += 1
             else:
                 # Unknown role - skip
@@ -1020,7 +921,6 @@ class VLLMProvider:
         tool_calls = []
         event_blocks: list[TextContent | ThinkingContent | ToolCallContent] = []
         text_accumulator: list[str] = []
-        reasoning_item_ids: list[str] = []  # Track reasoning IDs for metadata
 
         # Parse output blocks
         for block in response.output:
@@ -1044,54 +944,32 @@ class VLLMProvider:
                         event_blocks.append(TextContent(text=block_content))
 
                 elif block_type == "reasoning":
-                    # Extract reasoning ID and encrypted content for state preservation
-                    reasoning_id = getattr(block, "id", None)
-                    encrypted_content = getattr(block, "encrypted_content", None)
+                    # Extract reasoning text from content field
+                    # vLLM provides actual reasoning text here (not just summary like OpenAI!)
+                    reasoning_text = None
+                    block_content = getattr(block, "content", None)
 
-                    # Track reasoning item ID for metadata (backward compat)
-                    if reasoning_id:
-                        reasoning_item_ids.append(reasoning_id)
-
-                    # Extract reasoning summary if available
-                    reasoning_summary = getattr(block, "summary", None) or getattr(block, "text", None)
-
-                    # Use helper to extract reasoning text
-                    reasoning_text = extract_reasoning_text(reasoning_summary)
-
-                    # Fallback to original logic if helper didn't find text
-                    if reasoning_text is None and isinstance(reasoning_summary, list):
-                        # Extract text from list of summary objects (dict or Pydantic models)
+                    if block_content and isinstance(block_content, list):
+                        # Extract reasoning_text items from content array
                         texts = []
-                        for item in reasoning_summary:
-                            if isinstance(item, dict):
+                        for item in block_content:
+                            if isinstance(item, dict) and item.get("type") == "reasoning_text":
                                 texts.append(item.get("text", ""))
-                            elif hasattr(item, "text"):
+                            elif hasattr(item, "type") and item.type == "reasoning_text":  # type: ignore[union-attr]
                                 texts.append(getattr(item, "text", ""))
-                            elif isinstance(item, str):
-                                texts.append(item)
-                        reasoning_text = "\n".join(filter(None, texts))
-                    elif isinstance(reasoning_summary, str):
-                        reasoning_text = reasoning_summary
-                    elif isinstance(reasoning_summary, dict):
-                        reasoning_text = reasoning_summary.get("text", str(reasoning_summary))
-                    elif hasattr(reasoning_summary, "text"):
-                        reasoning_text = getattr(reasoning_summary, "text", str(reasoning_summary))
+                        if texts:
+                            reasoning_text = "\n".join(texts)
 
-                    # Only create thinking block if there's actual content
+                    # Create thinking block with reasoning text (displays to user)
                     if reasoning_text:
-                        # Store reasoning state in content field for re-insertion
-                        # content[0] = encrypted_content (for full reasoning continuity)
-                        # content[1] = reasoning_id (rs_* ID for OpenAI)
                         thinking_block = ThinkingBlock(
                             thinking=reasoning_text,
                             signature=None,
                             visibility="internal",
-                            content=[encrypted_content, reasoning_id],
+                            content=None,  # Simple: no encryption state needed
                         )
                         logger.info(
-                            f"[PROVIDER] Created ThinkingBlock: id={reasoning_id}, "
-                            f"has_encrypted={encrypted_content is not None}, "
-                            f"enc_len={len(encrypted_content) if encrypted_content else 0}"
+                            f"[PROVIDER] Created ThinkingBlock from content field: text_len={len(reasoning_text)}"
                         )
                         content_blocks.append(thinking_block)
                         event_blocks.append(ThinkingContent(text=reasoning_text))
@@ -1134,54 +1012,30 @@ class VLLMProvider:
                         event_blocks.append(TextContent(text=block_content, raw=block))
 
                 elif block_type == "reasoning":
-                    # Extract reasoning ID and encrypted content for state preservation
-                    reasoning_id = block.get("id")
-                    encrypted_content = block.get("encrypted_content")
+                    # Extract reasoning text from content field
+                    # vLLM provides actual reasoning text here (not just summary like OpenAI!)
+                    reasoning_text = None
+                    block_content = block.get("content")
 
-                    # Track reasoning item ID for metadata (backward compat)
-                    if reasoning_id:
-                        reasoning_item_ids.append(reasoning_id)
-
-                    # Extract reasoning summary if available
-                    reasoning_summary = block.get("summary") or block.get("text")
-
-                    # Use helper to extract reasoning text
-                    reasoning_text = extract_reasoning_text(reasoning_summary)
-
-                    # Fallback to original logic if helper didn't find text
-                    if reasoning_text is None and isinstance(reasoning_summary, list):
-                        # Extract text from list of summary objects (dict or Pydantic models)
+                    if block_content and isinstance(block_content, list):
+                        # Extract reasoning_text items from content array
                         texts = []
-                        for item in reasoning_summary:
-                            if isinstance(item, dict):
+                        for item in block_content:
+                            if isinstance(item, dict) and item.get("type") == "reasoning_text":
                                 texts.append(item.get("text", ""))
-                            elif hasattr(item, "text"):
-                                texts.append(getattr(item, "text", ""))
-                            elif isinstance(item, str):
-                                texts.append(item)
-                        reasoning_text = "\n".join(filter(None, texts))
-                    elif isinstance(reasoning_summary, str):
-                        reasoning_text = reasoning_summary
-                    elif isinstance(reasoning_summary, dict):
-                        reasoning_text = reasoning_summary.get("text", str(reasoning_summary))
-                    elif hasattr(reasoning_summary, "text"):
-                        reasoning_text = getattr(reasoning_summary, "text", str(reasoning_summary))
+                        if texts:
+                            reasoning_text = "\n".join(texts)
 
-                    # Only create thinking block if there's actual content
+                    # Create thinking block with reasoning text (displays to user)
                     if reasoning_text:
-                        # Store reasoning state in content field for re-insertion
-                        # content[0] = encrypted_content (for full reasoning continuity)
-                        # content[1] = reasoning_id (rs_* ID for OpenAI)
                         thinking_block = ThinkingBlock(
                             thinking=reasoning_text,
                             signature=None,
                             visibility="internal",
-                            content=[encrypted_content, reasoning_id],
+                            content=None,  # Simple: no encryption state needed
                         )
                         logger.info(
-                            f"[PROVIDER] Created ThinkingBlock: id={reasoning_id}, "
-                            f"has_encrypted={encrypted_content is not None}, "
-                            f"enc_len={len(encrypted_content) if encrypted_content else 0}"
+                            f"[PROVIDER] Created ThinkingBlock from content field: text_len={len(reasoning_text)}"
                         )
                         content_blocks.append(thinking_block)
                         event_blocks.append(ThinkingContent(text=reasoning_text))
@@ -1244,10 +1098,6 @@ class VLLMProvider:
                         metadata[METADATA_INCOMPLETE_REASON] = incomplete_details.get("reason")
                     elif hasattr(incomplete_details, "reason"):
                         metadata[METADATA_INCOMPLETE_REASON] = incomplete_details.reason
-
-        # Reasoning item IDs (for explicit passing if needed)
-        if reasoning_item_ids:
-            metadata[METADATA_REASONING_ITEMS] = reasoning_item_ids
 
         # DEBUG: Log what we're returning
         logger.info(f"[PROVIDER] Returning ChatResponse with {len(content_blocks)} content blocks")

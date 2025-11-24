@@ -22,46 +22,10 @@ from amplifier_core.message_models import Usage
 
 from ._constants import METADATA_CONTINUATION_COUNT
 from ._constants import METADATA_INCOMPLETE_REASON
-from ._constants import METADATA_REASONING_ITEMS
 from ._constants import METADATA_RESPONSE_ID
 from ._constants import METADATA_STATUS
 
 logger = logging.getLogger(__name__)
-
-
-def extract_reasoning_text(reasoning_summary: Any) -> str | None:
-    """Extract reasoning text from various summary formats.
-
-    vLLM returns reasoning summaries in different formats depending on the response.
-    This handles all known formats and extracts the text content.
-
-    Args:
-        reasoning_summary: The summary field from a reasoning block
-
-    Returns:
-        Extracted text or None if no text found
-    """
-    reasoning_text = None
-
-    if isinstance(reasoning_summary, list):
-        # Extract text from list of summary objects (dict or Pydantic models)
-        texts = []
-        for item in reasoning_summary:
-            if isinstance(item, dict):
-                texts.append(item.get("text", ""))
-            elif hasattr(item, "text"):
-                texts.append(getattr(item, "text", ""))
-            elif isinstance(item, str):
-                texts.append(item)
-        reasoning_text = "\n".join(filter(None, texts))
-    elif isinstance(reasoning_summary, str):
-        reasoning_text = reasoning_summary
-    elif isinstance(reasoning_summary, dict):
-        reasoning_text = reasoning_summary.get("text", str(reasoning_summary))
-    elif hasattr(reasoning_summary, "text"):
-        reasoning_text = getattr(reasoning_summary, "text", str(reasoning_summary))
-
-    return reasoning_text if reasoning_text else None
 
 
 def convert_response_with_accumulated_output(
@@ -89,7 +53,6 @@ def convert_response_with_accumulated_output(
     tool_calls = []
     event_blocks: list[TextContent | ThinkingContent | ToolCallContent] = []
     text_accumulator: list[str] = []
-    reasoning_item_ids: list[str] = []
 
     # Process ALL accumulated output items
     for block in accumulated_output:
@@ -113,29 +76,30 @@ def convert_response_with_accumulated_output(
                     event_blocks.append(TextContent(text=block_content))
 
             elif block_type == "reasoning":
-                # Extract reasoning ID and encrypted content for state preservation
-                reasoning_id = getattr(block, "id", None)
-                encrypted_content = getattr(block, "encrypted_content", None)
+                # Extract reasoning text from content field
+                # vLLM provides actual reasoning text here (not just summary like OpenAI!)
+                reasoning_text = None
+                block_content = getattr(block, "content", None)
 
-                # Track reasoning item ID for metadata (backward compat)
-                if reasoning_id:
-                    reasoning_item_ids.append(reasoning_id)
+                if block_content and isinstance(block_content, list):
+                    # Extract reasoning_text items from content array
+                    texts = []
+                    for item in block_content:
+                        if isinstance(item, dict) and item.get("type") == "reasoning_text":
+                            texts.append(item.get("text", ""))
+                        elif hasattr(item, "type") and item.type == "reasoning_text":  # type: ignore[union-attr]
+                            texts.append(getattr(item, "text", ""))
+                    if texts:
+                        reasoning_text = "\n".join(texts)
 
-                # Extract reasoning summary
-                reasoning_summary = getattr(block, "summary", None) or getattr(block, "text", None)
-                reasoning_text = extract_reasoning_text(reasoning_summary)
-
-                # Only create thinking block if there's actual content
+                # Create thinking block with reasoning text (displays to user)
                 if reasoning_text:
-                    # Store reasoning state in content field for re-insertion
-                    # content[0] = encrypted_content (for full reasoning continuity)
-                    # content[1] = reasoning_id (rs_* ID for OpenAI)
                     content_blocks.append(
                         ThinkingBlock(
                             thinking=reasoning_text,
                             signature=None,
                             visibility="internal",
-                            content=[encrypted_content, reasoning_id],
+                            content=None,  # Simple: no encryption state needed
                         )
                     )
                     event_blocks.append(ThinkingContent(text=reasoning_text))
@@ -180,29 +144,28 @@ def convert_response_with_accumulated_output(
                     event_blocks.append(TextContent(text=block_content, raw=block))
 
             elif block_type == "reasoning":
-                # Extract reasoning ID and encrypted content for state preservation
-                reasoning_id = block.get("id")
-                encrypted_content = block.get("encrypted_content")
+                # Extract reasoning text from content field
+                # vLLM provides actual reasoning text here (not just summary like OpenAI!)
+                reasoning_text = None
+                block_content = block.get("content")
 
-                # Track reasoning item ID for metadata (backward compat)
-                if reasoning_id:
-                    reasoning_item_ids.append(reasoning_id)
+                if block_content and isinstance(block_content, list):
+                    # Extract reasoning_text items from content array
+                    texts = []
+                    for item in block_content:
+                        if isinstance(item, dict) and item.get("type") == "reasoning_text":
+                            texts.append(item.get("text", ""))
+                    if texts:
+                        reasoning_text = "\n".join(texts)
 
-                # Extract reasoning summary
-                reasoning_summary = block.get("summary") or block.get("text")
-                reasoning_text = extract_reasoning_text(reasoning_summary)
-
-                # Only create thinking block if there's actual content
+                # Create thinking block with reasoning text (displays to user)
                 if reasoning_text:
-                    # Store reasoning state in content field for re-insertion
-                    # content[0] = encrypted_content (for full reasoning continuity)
-                    # content[1] = reasoning_id (rs_* ID for OpenAI)
                     content_blocks.append(
                         ThinkingBlock(
                             thinking=reasoning_text,
                             signature=None,
                             visibility="internal",
-                            content=[encrypted_content, reasoning_id],
+                            content=None,  # Simple: no encryption state needed
                         )
                     )
                     event_blocks.append(ThinkingContent(text=reasoning_text))
@@ -263,10 +226,6 @@ def convert_response_with_accumulated_output(
                     metadata[METADATA_INCOMPLETE_REASON] = incomplete_details.get("reason")
                 elif hasattr(incomplete_details, "reason"):
                     metadata[METADATA_INCOMPLETE_REASON] = incomplete_details.reason
-
-    # Reasoning item IDs (for explicit passing if needed)
-    if reasoning_item_ids:
-        metadata[METADATA_REASONING_ITEMS] = reasoning_item_ids
 
     # Continuation count (for debugging/metrics)
     if continuation_count > 0:
