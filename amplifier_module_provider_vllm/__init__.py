@@ -14,7 +14,9 @@ import uuid
 from typing import Any
 from typing import cast
 
+from amplifier_core import ModelInfo
 from amplifier_core import ModuleCoordinator
+from amplifier_core import ProviderInfo
 from amplifier_core.content_models import TextContent
 from amplifier_core.content_models import ThinkingContent
 from amplifier_core.content_models import ToolCallContent
@@ -118,6 +120,48 @@ class VLLMProvider:
 
         # Provider priority for selection (lower = higher priority)
         self.priority = self.config.get("priority", 100)
+
+    def get_info(self) -> ProviderInfo:
+        """Get provider metadata."""
+        return ProviderInfo(
+            id="vllm",
+            display_name="vLLM",
+            credential_env_vars=[],  # No API key needed for vLLM
+            capabilities=["streaming", "tools", "reasoning", "local"],
+            defaults={
+                "model": self.default_model,
+                "max_tokens": 16384,
+                "temperature": None,
+                "timeout": 300.0,
+            },
+        )
+
+    async def list_models(self) -> list[ModelInfo]:
+        """
+        List available models from vLLM server.
+
+        vLLM serves a single model per instance, so we query
+        the models endpoint to get info about the loaded model.
+        """
+        try:
+            # vLLM supports OpenAI-compatible /v1/models endpoint
+            models_response = await self.client.models.list()
+            models = []
+            for model in models_response.data:
+                models.append(
+                    ModelInfo(
+                        id=model.id,
+                        display_name=model.id,
+                        context_window=128000,  # Default, vLLM doesn't expose this
+                        max_output_tokens=32768,  # Default
+                        capabilities=["tools", "streaming", "reasoning", "local"],
+                        defaults={"temperature": None, "max_tokens": 16384},
+                    )
+                )
+            return models
+        except Exception as e:
+            logger.warning(f"Failed to list vLLM models: {e}")
+            return []
 
     def _build_continuation_input(self, original_input: list, accumulated_output: list) -> list:
         """Build input for continuation call in stateless mode.
