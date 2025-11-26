@@ -14,6 +14,7 @@ import uuid
 from typing import Any
 from typing import cast
 
+from amplifier_core import ConfigField
 from amplifier_core import ModelInfo
 from amplifier_core import ModuleCoordinator
 from amplifier_core import ProviderInfo
@@ -134,6 +135,17 @@ class VLLMProvider:
                 "temperature": None,
                 "timeout": 300.0,
             },
+            config_fields=[
+                ConfigField(
+                    id="base_url",
+                    display_name="Server URL",
+                    prompt="vLLM server URL",
+                    field_type="text",
+                    env_var="VLLM_BASE_URL",
+                    default="http://localhost:8000/v1",
+                    required=True,
+                ),
+            ],
         )
 
     async def list_models(self) -> list[ModelInfo]:
