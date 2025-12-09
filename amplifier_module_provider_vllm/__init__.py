@@ -5,6 +5,9 @@ Integrates with vLLM's OpenAI-compatible Responses API.
 
 __all__ = ["mount", "VLLMProvider"]
 
+# Amplifier module metadata
+__amplifier_module_type__ = "provider"
+
 import asyncio
 import json
 import logging
