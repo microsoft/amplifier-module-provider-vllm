@@ -18,9 +18,9 @@ from amplifier_core import ConfigField
 from amplifier_core import ModelInfo
 from amplifier_core import ModuleCoordinator
 from amplifier_core import ProviderInfo
-from amplifier_core.content_models import TextContent
-from amplifier_core.content_models import ThinkingContent
-from amplifier_core.content_models import ToolCallContent
+from amplifier_core import TextContent
+from amplifier_core import ThinkingContent
+from amplifier_core import ToolCallContent
 from amplifier_core.message_models import ChatRequest
 from amplifier_core.message_models import ChatResponse
 from amplifier_core.message_models import ToolCall

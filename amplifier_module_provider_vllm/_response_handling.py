@@ -11,9 +11,9 @@ import json
 import logging
 from typing import Any
 
-from amplifier_core.content_models import TextContent
-from amplifier_core.content_models import ThinkingContent
-from amplifier_core.content_models import ToolCallContent
+from amplifier_core import TextContent
+from amplifier_core import ThinkingContent
+from amplifier_core import ToolCallContent
 from amplifier_core.message_models import TextBlock
 from amplifier_core.message_models import ThinkingBlock
 from amplifier_core.message_models import ToolCall
