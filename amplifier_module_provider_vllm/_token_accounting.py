@@ -12,7 +12,7 @@ Key limitations:
 - Output token count only reflects visible 'final' text, not hidden chain-of-thought
   channels (requires direct vLLM-Python call with raw token IDs, not possible via REST)
 - This provides the best possible accuracy without modifying vLLM's API layer
-- Requires vocab files: automatically downloads to ~/.amplifier/vocab/ on first use
+- Requires vocab files: automatically downloads to ~/.amplifier/cache/vocab/ on first use
 """
 
 import logging
@@ -38,7 +38,7 @@ _VOCAB_SETUP_ATTEMPTED = False
 def _ensure_vocab_files() -> bool:
     """Ensure required vocab files exist, auto-download if needed.
 
-    Downloads vocab files to ~/.amplifier/vocab/ on first use.
+    Downloads vocab files to ~/.amplifier/cache/vocab/ on first use.
     Sets TIKTOKEN_ENCODINGS_BASE to point to this directory.
 
     Returns:
@@ -57,8 +57,8 @@ def _ensure_vocab_files() -> bool:
         logger.debug("[TOKEN_ACCOUNTING] TIKTOKEN_ENCODINGS_BASE already set, skipping download")
         return True
 
-    # Setup vocab directory in ~/.amplifier/vocab/
-    vocab_dir = Path.home() / ".amplifier" / "vocab"
+    # Setup vocab directory in ~/.amplifier/cache/vocab/
+    vocab_dir = Path.home() / ".amplifier" / "cache" / "vocab"
     vocab_dir.mkdir(parents=True, exist_ok=True)
 
     required_files = {
@@ -70,7 +70,7 @@ def _ensure_vocab_files() -> bool:
     all_exist = all((vocab_dir / filename).exists() for filename in required_files)
 
     if not all_exist:
-        logger.info("[TOKEN_ACCOUNTING] Downloading Harmony vocab files to ~/.amplifier/vocab/...")
+        logger.info("[TOKEN_ACCOUNTING] Downloading Harmony vocab files to ~/.amplifier/cache/vocab/...")
 
         try:
             import urllib.request
@@ -116,7 +116,7 @@ def _get_harmony_encoding():
         except Exception as e:
             logger.warning(
                 f"[TOKEN_ACCOUNTING] Failed to load Harmony encoder: {e}. "
-                "Token accounting disabled. Check vocab files in ~/.amplifier/vocab/"
+                "Token accounting disabled. Check vocab files in ~/.amplifier/cache/vocab/"
             )
             return None
 
