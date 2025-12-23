@@ -829,14 +829,14 @@ class VLLMProvider:
 
         Handles:
         - User messages: Simple string content
-        - Assistant messages: Simple string content with tool calls if present
-        - Tool messages: Converts to text format
+        - Assistant messages: Simple string content with tool calls as function_call items
+        - Tool messages: Native function_call_output format for explicit correlation
 
         Args:
             messages: List of message dicts from ChatRequest
 
         Returns:
-            List of vLLM-formatted message objects with simple string content
+            List of vLLM-formatted message objects with proper function_call handling
         """
         openai_messages = []
         i = 0
@@ -851,29 +851,63 @@ class VLLMProvider:
                 i += 1
                 continue
 
-            # Handle tool result messages
+            # Handle tool result messages - use native function_call_output format
             if role == "tool":
-                # For OpenAI Responses API, convert tool results to text
-                tool_results_parts = []
                 while i < len(messages) and messages[i].get("role") == "tool":
                     tool_msg = messages[i]
-                    tool_name = tool_msg.get("tool_name", "unknown")
+                    tool_call_id = tool_msg.get("tool_call_id")
                     tool_content = tool_msg.get("content", "")
+                    tool_name = tool_msg.get("tool_name", "unknown")
 
-                    # Format as text for API
-                    tool_results_parts.append(f"[Tool: {tool_name}]\n{tool_content}")
+                    if tool_call_id:
+                        # Native format: function_call_output with call_id for explicit correlation
+                        # vLLM Responses API supports this format for precise tool result matching
+                        output_str = tool_content if isinstance(tool_content, str) else json.dumps(tool_content)
+                        openai_messages.append(
+                            {
+                                "type": "function_call_output",
+                                "call_id": tool_call_id,
+                                "output": output_str,
+                            }
+                        )
+                    else:
+                        # Fallback for messages without tool_call_id (legacy/compacted messages)
+                        logger.warning(
+                            f"Tool result missing tool_call_id for '{tool_name}', using text fallback. "
+                            "This may reduce model accuracy for multi-tool scenarios."
+                        )
+                        openai_messages.append({"role": "user", "content": f"[Tool: {tool_name}]\n{tool_content}"})
                     i += 1
-
-                # Add as user message with combined tool results as simple string
-                if tool_results_parts:
-                    combined_text = "\n\n".join(tool_results_parts)
-                    openai_messages.append({"role": "user", "content": combined_text})
                 continue
 
             # Handle assistant messages
             if role == "assistant":
                 reasoning_items_to_add = []  # Top-level reasoning items (before assistant message)
+                function_call_items = []  # Top-level function_call items (for tool calls)
                 text_parts = []  # Accumulate text for simple string content
+
+                # Handle tool_calls field (from context storage)
+                tool_calls_field = msg.get("tool_calls", [])
+                for tc in tool_calls_field:
+                    tc_id = tc.get("id") or tc.get("tool_call_id", "")
+                    tc_name = tc.get("name", "")
+                    tc_args = tc.get("arguments") or tc.get("input", {})
+                    if isinstance(tc_args, str):
+                        tc_args_str = tc_args
+                    else:
+                        tc_args_str = json.dumps(tc_args) if tc_args else "{}"
+                    if tc_id and tc_name:
+                        # vLLM requires complete function_call object including status field
+                        function_call_items.append(
+                            {
+                                "type": "function_call",
+                                "call_id": tc_id,
+                                "name": tc_name,
+                                "arguments": tc_args_str,
+                                "id": f"ft_{tc_id.replace('call_', '')}",  # Generate matching id
+                                "status": None,  # vLLM requires this field
+                            }
+                        )
 
                 # Handle structured content (list of blocks)
                 if isinstance(content, list):
@@ -883,6 +917,26 @@ class VLLMProvider:
                             block_type = block.get("type")
                             if block_type == "text":
                                 text_parts.append(block.get("text", ""))
+                            elif block_type == "tool_call":
+                                # Convert tool_call block to function_call item
+                                tc_id = block.get("id", "")
+                                tc_name = block.get("name", "")
+                                tc_input = block.get("input", {})
+                                if isinstance(tc_input, str):
+                                    tc_args_str = tc_input
+                                else:
+                                    tc_args_str = json.dumps(tc_input) if tc_input else "{}"
+                                if tc_id and tc_name:
+                                    function_call_items.append(
+                                        {
+                                            "type": "function_call",
+                                            "call_id": tc_id,
+                                            "name": tc_name,
+                                            "arguments": tc_args_str,
+                                            "id": f"ft_{tc_id.replace('call_', '')}",
+                                            "status": None,
+                                        }
+                                    )
                             elif block_type == "thinking":
                                 # Extract reasoning text for re-insertion
                                 thinking_text = block.get("thinking", "")
@@ -900,9 +954,29 @@ class VLLMProvider:
                                     }
                                     reasoning_items_to_add.append(reasoning_item)
                         elif hasattr(block, "type"):
-                            # Handle ContentBlock objects (TextBlock, ThinkingBlock, etc.)
+                            # Handle ContentBlock objects (TextBlock, ThinkingBlock, ToolCallBlock, etc.)
                             if block.type == "text":
                                 text_parts.append(block.text)
+                            elif block.type == "tool_call":
+                                # Convert ToolCallBlock to function_call item
+                                tc_id = getattr(block, "id", "")
+                                tc_name = getattr(block, "name", "")
+                                tc_input = getattr(block, "input", {})
+                                if isinstance(tc_input, str):
+                                    tc_args_str = tc_input
+                                else:
+                                    tc_args_str = json.dumps(tc_input) if tc_input else "{}"
+                                if tc_id and tc_name:
+                                    function_call_items.append(
+                                        {
+                                            "type": "function_call",
+                                            "call_id": tc_id,
+                                            "name": tc_name,
+                                            "arguments": tc_args_str,
+                                            "id": f"ft_{tc_id.replace('call_', '')}",
+                                            "status": None,
+                                        }
+                                    )
                             elif block.type == "thinking" and hasattr(block, "thinking"):
                                 # Extract reasoning text for re-insertion
                                 thinking_text = block.thinking
@@ -923,13 +997,20 @@ class VLLMProvider:
                 elif isinstance(content, str) and content:
                     text_parts.append(content)
 
-                # Add reasoning items as TOP-LEVEL entries (before assistant message)
+                # Add reasoning items as TOP-LEVEL entries (before function_calls and text)
                 for reasoning_item in reasoning_items_to_add:
                     openai_messages.append(reasoning_item)
                     logger.debug(
                         f"[PROVIDER] Added reasoning item: id={reasoning_item['id']}, "
                         f"summary_len={len(reasoning_item['summary'][0]['text'])} chars, "
                         f"content_len={len(reasoning_item['content'][0]['text'])} chars"
+                    )
+
+                # Add function_call items as TOP-LEVEL entries (after reasoning, before text)
+                for fc_item in function_call_items:
+                    openai_messages.append(fc_item)
+                    logger.debug(
+                        f"[PROVIDER] Added function_call item: call_id={fc_item['call_id']}, name={fc_item['name']}"
                     )
 
                 # Only add assistant message if there's text content
