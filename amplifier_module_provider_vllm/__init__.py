@@ -125,6 +125,12 @@ class VLLMProvider:
         # Provider priority for selection (lower = higher priority)
         self.priority = self.config.get("priority", 100)
 
+        # Track tool call IDs that have been repaired with synthetic results.
+        # This prevents infinite loops when the same missing tool results are
+        # detected repeatedly across LLM iterations (since synthetic results
+        # are injected into request.messages but not persisted to message store).
+        self._repaired_tool_ids: set[str] = set()
+
     def get_info(self) -> ProviderInfo:
         """Get provider metadata."""
         return ProviderInfo(
@@ -277,6 +283,9 @@ class VLLMProvider:
         Scans conversation for assistant tool calls and validates each has
         a corresponding tool result message. Returns missing pairs.
 
+        Filters out tool call IDs that have already been repaired with synthetic
+        results to prevent infinite detection loops across LLM iterations.
+
         Returns:
             List of (call_id, tool_name, tool_arguments) tuples for unpaired calls
         """
@@ -296,7 +305,12 @@ class VLLMProvider:
             elif msg.role == "tool" and hasattr(msg, "tool_call_id") and msg.tool_call_id:
                 tool_results.add(msg.tool_call_id)
 
-        return [(call_id, name, args) for call_id, (name, args) in tool_calls.items() if call_id not in tool_results]
+        # Exclude IDs that have already been repaired to prevent infinite loops
+        return [
+            (call_id, name, args)
+            for call_id, (name, args) in tool_calls.items()
+            if call_id not in tool_results and call_id not in self._repaired_tool_ids
+        ]
 
     def _create_synthetic_result(self, call_id: str, tool_name: str):
         """Create synthetic error result for missing tool response.
@@ -342,10 +356,12 @@ class VLLMProvider:
                 f"Tool IDs: {[call_id for call_id, _, _ in missing]}"
             )
 
-            # Inject synthetic results
+            # Inject synthetic results and track repaired IDs to prevent infinite loops
             for call_id, tool_name, _ in missing:
                 synthetic = self._create_synthetic_result(call_id, tool_name)
                 request.messages.append(synthetic)
+                # Track this ID so we don't detect it as missing again in future iterations
+                self._repaired_tool_ids.add(call_id)
 
             # Emit observability event
             if self.coordinator and hasattr(self.coordinator, "hooks"):
