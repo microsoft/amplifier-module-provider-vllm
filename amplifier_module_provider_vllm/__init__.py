@@ -89,22 +89,16 @@ class VLLMProvider:
     ):
         """Initialize vLLM provider with Responses API client.
 
+        The SDK client is created lazily on first use, allowing get_info()
+        to work without a running vLLM server.
+
         Args:
             base_url: vLLM server URL (e.g., http://192.168.128.5:8000/v1)
             config: Provider configuration
             coordinator: Module coordinator
             client: Pre-configured AsyncOpenAI client (for testing)
         """
-        if client is None:
-            if base_url is None:
-                raise ValueError("base_url or client must be provided")
-            # vLLM uses OpenAI-compatible API but with custom base_url
-            self.client = AsyncOpenAI(
-                base_url=base_url,
-                api_key="EMPTY",  # vLLM doesn't require API key
-            )
-        else:
-            self.client = client
+        self._client: AsyncOpenAI | None = client  # Lazy init if None
         self.config = config or {}
         self.coordinator = coordinator
         self.base_url = base_url
@@ -130,6 +124,18 @@ class VLLMProvider:
         # detected repeatedly across LLM iterations (since synthetic results
         # are injected into request.messages but not persisted to message store).
         self._repaired_tool_ids: set[str] = set()
+
+    @property
+    def client(self) -> AsyncOpenAI:
+        """Lazily initialize the vLLM client on first access."""
+        if self._client is None:
+            if self.base_url is None:
+                raise ValueError("base_url or client must be provided for API calls")
+            self._client = AsyncOpenAI(
+                base_url=self.base_url,
+                api_key="EMPTY",  # vLLM doesn't require API key
+            )
+        return self._client
 
     def get_info(self) -> ProviderInfo:
         """Get provider metadata."""
