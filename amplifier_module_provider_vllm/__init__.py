@@ -171,26 +171,24 @@ class VLLMProvider:
 
         vLLM serves a single model per instance, so we query
         the models endpoint to get info about the loaded model.
+        Raises exception if server is unreachable (no fallback - caller handles errors).
         """
-        try:
-            # vLLM supports OpenAI-compatible /v1/models endpoint
-            models_response = await self.client.models.list()
-            models = []
-            for model in models_response.data:
-                models.append(
-                    ModelInfo(
-                        id=model.id,
-                        display_name=model.id,
-                        context_window=128000,  # Default, vLLM doesn't expose this
-                        max_output_tokens=32768,  # Default
-                        capabilities=["tools", "streaming", "reasoning", "local"],
-                        defaults={"temperature": None, "max_tokens": 16384},
-                    )
+        # vLLM supports OpenAI-compatible /v1/models endpoint
+        # Let exceptions propagate - connection errors should be shown to user
+        models_response = await self.client.models.list()
+        models = []
+        for model in models_response.data:
+            models.append(
+                ModelInfo(
+                    id=model.id,
+                    display_name=model.id,
+                    context_window=128000,  # Default, vLLM doesn't expose this
+                    max_output_tokens=32768,  # Default
+                    capabilities=["tools", "streaming", "reasoning", "local"],
+                    defaults={"temperature": None, "max_tokens": 16384},
                 )
-            return models
-        except Exception as e:
-            logger.warning(f"Failed to list vLLM models: {e}")
-            return []
+            )
+        return models
 
     def _build_continuation_input(self, original_input: list, accumulated_output: list) -> list:
         """Build input for continuation call in stateless mode.
