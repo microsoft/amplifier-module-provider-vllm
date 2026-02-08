@@ -1552,11 +1552,19 @@ class VLLMProvider:
             if details and hasattr(details, "reasoning_tokens"):
                 reasoning_tokens = details.reasoning_tokens
 
+        # Extract cache_read_tokens from input_tokens_details
+        cache_read_tokens = None
+        if usage_obj and hasattr(usage_obj, "input_tokens_details"):
+            details = usage_obj.input_tokens_details
+            if details and hasattr(details, "cached_tokens"):
+                cache_read_tokens = details.cached_tokens or None
+
         usage = Usage(
             input_tokens=usage_counts["input"],
             output_tokens=usage_counts["output"],
             total_tokens=usage_counts["total"],
             reasoning_tokens=reasoning_tokens,
+            cache_read_tokens=cache_read_tokens,
         )
 
         combined_text = "\n\n".join(text_accumulator).strip()
