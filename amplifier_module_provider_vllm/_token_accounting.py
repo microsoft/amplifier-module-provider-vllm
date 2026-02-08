@@ -54,7 +54,9 @@ def _ensure_vocab_files() -> bool:
 
     # Check if already configured
     if "TIKTOKEN_ENCODINGS_BASE" in os.environ:
-        logger.debug("[TOKEN_ACCOUNTING] TIKTOKEN_ENCODINGS_BASE already set, skipping download")
+        logger.debug(
+            "[TOKEN_ACCOUNTING] TIKTOKEN_ENCODINGS_BASE already set, skipping download"
+        )
         return True
 
     # Setup vocab directory in ~/.amplifier/cache/vocab/
@@ -70,7 +72,9 @@ def _ensure_vocab_files() -> bool:
     all_exist = all((vocab_dir / filename).exists() for filename in required_files)
 
     if not all_exist:
-        logger.info("[TOKEN_ACCOUNTING] Downloading Harmony vocab files to ~/.amplifier/cache/vocab/...")
+        logger.info(
+            "[TOKEN_ACCOUNTING] Downloading Harmony vocab files to ~/.amplifier/cache/vocab/..."
+        )
 
         try:
             import urllib.request
@@ -80,7 +84,9 @@ def _ensure_vocab_files() -> bool:
                 if not filepath.exists():
                     logger.debug(f"[TOKEN_ACCOUNTING] Downloading {filename}...")
                     urllib.request.urlretrieve(url, filepath)
-                    logger.info(f"[TOKEN_ACCOUNTING] Downloaded {filename} ({filepath.stat().st_size} bytes)")
+                    logger.info(
+                        f"[TOKEN_ACCOUNTING] Downloaded {filename} ({filepath.stat().st_size} bytes)"
+                    )
 
         except Exception as e:
             logger.warning(
@@ -107,11 +113,15 @@ def _get_harmony_encoding():
     if _HARMONY_ENCODING is None:
         # Ensure vocab files are available
         if not _ensure_vocab_files():
-            logger.warning("[TOKEN_ACCOUNTING] Vocab files not available, token accounting disabled")
+            logger.warning(
+                "[TOKEN_ACCOUNTING] Vocab files not available, token accounting disabled"
+            )
             return None
 
         try:
-            _HARMONY_ENCODING = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
+            _HARMONY_ENCODING = load_harmony_encoding(
+                HarmonyEncodingName.HARMONY_GPT_OSS
+            )
             logger.info("[TOKEN_ACCOUNTING] Loaded Harmony GPT-OSS encoder")
         except Exception as e:
             logger.warning(
@@ -208,14 +218,18 @@ def compute_input_tokens(params: dict[str, Any]) -> int:
         conversation = build_harmony_conversation(params)
 
         # Generate prefill token IDs (what the model sees as input)
-        prefill_ids = encoding.render_conversation_for_completion(conversation, Role.ASSISTANT)
+        prefill_ids = encoding.render_conversation_for_completion(
+            conversation, Role.ASSISTANT
+        )
 
         input_tokens = len(prefill_ids)
         logger.debug(f"[TOKEN_ACCOUNTING] Computed input tokens: {input_tokens}")
         return input_tokens
 
     except Exception as e:
-        logger.warning(f"[TOKEN_ACCOUNTING] Failed to compute input tokens: {e}", exc_info=True)
+        logger.warning(
+            f"[TOKEN_ACCOUNTING] Failed to compute input tokens: {e}", exc_info=True
+        )
         return 0
 
 
@@ -249,13 +263,15 @@ def extract_final_text(response: Any) -> str:
                         if isinstance(msg_content, list):
                             parts = []
                             for content_item in msg_content:
-                                if hasattr(content_item, "type") and content_item.type in (
+                                if hasattr(
+                                    content_item, "type"
+                                ) and content_item.type in (
                                     "text",
                                     "output_text",
                                 ):
-                                    text = getattr(content_item, "text", None) or getattr(
-                                        content_item, "output_text", None
-                                    )
+                                    text = getattr(
+                                        content_item, "text", None
+                                    ) or getattr(content_item, "output_text", None)
                                     if text:
                                         parts.append(text)
                             if parts:
@@ -268,7 +284,9 @@ def extract_final_text(response: Any) -> str:
                         parts = []
                         for content_item in msg_content:
                             if content_item.get("type") in ("text", "output_text"):
-                                text = content_item.get("text") or content_item.get("output_text")
+                                text = content_item.get("text") or content_item.get(
+                                    "output_text"
+                                )
                                 if text:
                                     parts.append(text)
                         if parts:
@@ -307,7 +325,9 @@ def compute_output_tokens(text: str) -> int:
         return output_tokens
 
     except Exception as e:
-        logger.warning(f"[TOKEN_ACCOUNTING] Failed to compute output tokens: {e}", exc_info=True)
+        logger.warning(
+            f"[TOKEN_ACCOUNTING] Failed to compute output tokens: {e}", exc_info=True
+        )
         return 0
 
 
