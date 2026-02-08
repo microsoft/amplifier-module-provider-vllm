@@ -148,7 +148,7 @@ class VLLMProvider:
                 "model": self.default_model,
                 "max_tokens": 16384,
                 "temperature": None,
-                "timeout": 300.0,
+                "timeout": 600.0,
                 "context_window": 128000,
                 "max_output_tokens": 128000,
             },

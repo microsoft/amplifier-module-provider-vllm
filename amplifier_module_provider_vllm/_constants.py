@@ -17,7 +17,7 @@ DEFAULT_MODEL = "openai/gpt-oss-20b"  # Default model for vLLM
 DEFAULT_MAX_TOKENS = 4096
 DEFAULT_REASONING_SUMMARY = "detailed"
 DEFAULT_DEBUG_TRUNCATE_LENGTH = 180
-DEFAULT_TIMEOUT = 300.0  # 5 minutes
+DEFAULT_TIMEOUT = 600.0  # 10 minutes
 DEFAULT_TRUNCATION = "auto"  # Automatic context management
 
 # Maximum number of continuation attempts for incomplete responses
