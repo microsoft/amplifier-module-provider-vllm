@@ -12,11 +12,12 @@ import asyncio
 import json
 import logging
 import os
+import random
 import time
 import uuid
 from typing import Any
-from typing import cast
 
+import openai
 from amplifier_core import ConfigField
 from amplifier_core import ModelInfo
 from amplifier_core import ModuleCoordinator
@@ -24,6 +25,7 @@ from amplifier_core import ProviderInfo
 from amplifier_core import TextContent
 from amplifier_core import ThinkingContent
 from amplifier_core import ToolCallContent
+from amplifier_core import llm_errors as kernel_errors
 from amplifier_core.message_models import ChatRequest
 from amplifier_core.message_models import ChatResponse
 from amplifier_core.message_models import ToolCall
@@ -36,7 +38,6 @@ from ._constants import DEFAULT_REASONING_SUMMARY
 from ._constants import DEFAULT_TIMEOUT
 from ._constants import DEFAULT_TRUNCATION
 from ._constants import MAX_CONTINUATION_ATTEMPTS
-from ._constants import METADATA_CONTINUATION_COUNT
 from ._constants import METADATA_INCOMPLETE_REASON
 from ._constants import METADATA_RESPONSE_ID
 from ._constants import METADATA_STATUS
@@ -59,7 +60,9 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     config = config or {}
 
     # vLLM server URL from config or environment
-    base_url = config.get("base_url") or os.environ.get("VLLM_BASE_URL", "http://localhost:8000/v1")
+    base_url = config.get("base_url") or os.environ.get(
+        "VLLM_BASE_URL", "http://localhost:8000/v1"
+    )
 
     provider = VLLMProvider(base_url=base_url, config=config, coordinator=coordinator)
     await coordinator.mount("providers", provider, name="vllm")
@@ -106,18 +109,38 @@ class VLLMProvider:
         # Configuration with sensible defaults (from _constants.py - single source of truth)
         self.default_model = self.config.get("default_model", DEFAULT_MODEL)
         self.max_tokens = self.config.get("max_tokens", DEFAULT_MAX_TOKENS)
-        self.temperature = self.config.get("temperature", None)  # None = not sent (some models don't support it)
-        self.reasoning = self.config.get("reasoning", None)  # None = not sent (minimal|low|medium|high)
-        self.reasoning_summary = self.config.get("reasoning_summary", DEFAULT_REASONING_SUMMARY)
-        self.truncation = self.config.get("truncation", DEFAULT_TRUNCATION)  # Automatic context management
+        self.temperature = self.config.get(
+            "temperature", None
+        )  # None = not sent (some models don't support it)
+        self.reasoning = self.config.get(
+            "reasoning", None
+        )  # None = not sent (minimal|low|medium|high)
+        self.reasoning_summary = self.config.get(
+            "reasoning_summary", DEFAULT_REASONING_SUMMARY
+        )
+        self.truncation = self.config.get(
+            "truncation", DEFAULT_TRUNCATION
+        )  # Automatic context management
         self.enable_state = self.config.get("enable_state", False)
-        self.debug = self.config.get("debug", False)  # Enable full request/response logging
-        self.raw_debug = self.config.get("raw_debug", False)  # Enable ultra-verbose raw API I/O logging
-        self.debug_truncate_length = self.config.get("debug_truncate_length", DEFAULT_DEBUG_TRUNCATE_LENGTH)
+        self.debug = self.config.get(
+            "debug", False
+        )  # Enable full request/response logging
+        self.raw_debug = self.config.get(
+            "raw_debug", False
+        )  # Enable ultra-verbose raw API I/O logging
+        self.debug_truncate_length = self.config.get(
+            "debug_truncate_length", DEFAULT_DEBUG_TRUNCATE_LENGTH
+        )
         self.timeout = self.config.get("timeout", DEFAULT_TIMEOUT)
 
         # Provider priority for selection (lower = higher priority)
         self.priority = self.config.get("priority", 100)
+
+        # Phase 2: Retry configuration
+        self._max_retries = int(self.config.get("max_retries", 5))
+        self._min_retry_delay = float(self.config.get("min_retry_delay", 1.0))
+        self._max_retry_delay = float(self.config.get("max_retry_delay", 60.0))
+        self._retry_jitter = bool(self.config.get("retry_jitter", True))
 
         # Track tool call IDs that have been repaired with synthetic results.
         # This prevents infinite loops when the same missing tool results are
@@ -134,8 +157,28 @@ class VLLMProvider:
             self._client = AsyncOpenAI(
                 base_url=self.base_url,
                 api_key="EMPTY",  # vLLM doesn't require API key
+                max_retries=0,  # Phase 2: Disable SDK retries — we handle retry ourselves
             )
         return self._client
+
+    def _calculate_retry_delay(self, retry_after: float | None, attempt: int) -> float:
+        """Calculate retry delay with exponential backoff and optional jitter.
+
+        Args:
+            retry_after: Server-suggested delay (from Retry-After header), or None.
+            attempt: Current attempt number (1-based).
+
+        Returns:
+            Delay in seconds before the next retry.
+        """
+        if retry_after is not None and retry_after > 0:
+            delay = retry_after
+        else:
+            delay = self._min_retry_delay * (2 ** (attempt - 1))
+        delay = min(delay, self._max_retry_delay)
+        if self._retry_jitter:
+            delay *= random.uniform(0.8, 1.2)
+        return delay
 
     def get_info(self) -> ProviderInfo:
         """Get provider metadata."""
@@ -190,7 +233,9 @@ class VLLMProvider:
             )
         return models
 
-    def _build_continuation_input(self, original_input: list, accumulated_output: list) -> list:
+    def _build_continuation_input(
+        self, original_input: list, accumulated_output: list
+    ) -> list:
         """Build input for continuation call in stateless mode.
 
         Instead of using previous_response_id (requires store:true), we include
@@ -222,10 +267,15 @@ class VLLMProvider:
                     # Extract text from message content
                     content = getattr(item, "content", [])
                     for content_item in content:
-                        if hasattr(content_item, "type") and content_item.type == "output_text":
+                        if (
+                            hasattr(content_item, "type")
+                            and content_item.type == "output_text"
+                        ):
                             text = getattr(content_item, "text", "")
                             if text:
-                                assistant_content.append({"type": "output_text", "text": text})
+                                assistant_content.append(
+                                    {"type": "output_text", "text": text}
+                                )
                 elif item_type == "reasoning":
                     # For reasoning, we can't really include it in input as text
                     # The reasoning trace is internal and not meant for reinsertion
@@ -244,11 +294,15 @@ class VLLMProvider:
                         if content_item.get("type") == "output_text":
                             text = content_item.get("text", "")
                             if text:
-                                assistant_content.append({"type": "output_text", "text": text})
+                                assistant_content.append(
+                                    {"type": "output_text", "text": text}
+                                )
 
         # If we extracted any assistant content, add as assistant message
         if assistant_content:
-            continuation_input.append({"role": "assistant", "content": assistant_content})
+            continuation_input.append(
+                {"role": "assistant", "content": assistant_content}
+            )
 
         return continuation_input
 
@@ -269,11 +323,15 @@ class VLLMProvider:
             max_length = self.debug_truncate_length
 
         # Type guard: max_length is guaranteed to be int after this point
-        assert max_length is not None, "max_length should never be None after initialization"
+        assert max_length is not None, (
+            "max_length should never be None after initialization"
+        )
 
         if isinstance(obj, str):
             if len(obj) > max_length:
-                return obj[:max_length] + f"... (truncated {len(obj) - max_length} chars)"
+                return (
+                    obj[:max_length] + f"... (truncated {len(obj) - max_length} chars)"
+                )
             return obj
         if isinstance(obj, dict):
             return {k: self._truncate_values(v, max_length) for k, v in obj.items()}
@@ -293,8 +351,6 @@ class VLLMProvider:
         Returns:
             List of (call_id, tool_name, tool_arguments) tuples for unpaired calls
         """
-        from amplifier_core.message_models import Message
-
         tool_calls = {}  # {call_id: (name, args)}
         tool_results = set()  # {call_id}
 
@@ -306,7 +362,9 @@ class VLLMProvider:
                         tool_calls[block.id] = (block.name, block.input)
 
             # Check tool messages for tool_call_id
-            elif msg.role == "tool" and hasattr(msg, "tool_call_id") and msg.tool_call_id:
+            elif (
+                msg.role == "tool" and hasattr(msg, "tool_call_id") and msg.tool_call_id
+            ):
                 tool_results.add(msg.tool_call_id)
 
         # Exclude IDs that have already been repaired to prevent infinite loops
@@ -375,7 +433,8 @@ class VLLMProvider:
                         "provider": self.name,
                         "repair_count": len(missing),
                         "repairs": [
-                            {"tool_call_id": call_id, "tool_name": tool_name} for call_id, tool_name, _ in missing
+                            {"tool_call_id": call_id, "tool_name": tool_name}
+                            for call_id, tool_name, _ in missing
                         ],
                     },
                 )
@@ -396,7 +455,9 @@ class VLLMProvider:
             return []
         return response.tool_calls
 
-    async def _complete_chat_request(self, request: ChatRequest, **kwargs) -> ChatResponse:
+    async def _complete_chat_request(
+        self, request: ChatRequest, **kwargs
+    ) -> ChatResponse:
         """Handle ChatRequest format with developer message conversion.
 
         Args:
@@ -406,7 +467,9 @@ class VLLMProvider:
         Returns:
             ChatResponse with content blocks
         """
-        logger.info(f"[PROVIDER] Received ChatRequest with {len(request.messages)} messages")
+        logger.info(
+            f"[PROVIDER] Received ChatRequest with {len(request.messages)} messages"
+        )
         logger.info(f"[PROVIDER] Message roles: {[m.role for m in request.messages]}")
 
         message_list = list(request.messages)
@@ -414,7 +477,9 @@ class VLLMProvider:
         # Separate messages by role
         system_msgs = [m for m in message_list if m.role == "system"]
         developer_msgs = [m for m in message_list if m.role == "developer"]
-        conversation = [m for m in message_list if m.role in ("user", "assistant", "tool")]
+        conversation = [
+            m for m in message_list if m.role in ("user", "assistant", "tool")
+        ]
 
         logger.info(
             f"[PROVIDER] Separated: {len(system_msgs)} system, {len(developer_msgs)} developer, {len(conversation)} conversation"
@@ -422,7 +487,11 @@ class VLLMProvider:
 
         # Combine system messages as instructions
         instructions = (
-            "\n\n".join(m.content if isinstance(m.content, str) else "" for m in system_msgs) if system_msgs else None
+            "\n\n".join(
+                m.content if isinstance(m.content, str) else "" for m in system_msgs
+            )
+            if system_msgs
+            else None
         )
 
         # Convert all messages (developer + conversation) to Responses API format
@@ -497,20 +566,37 @@ class VLLMProvider:
         elif temperature := kwargs.get("temperature", self.temperature):
             params["temperature"] = temperature
 
-        reasoning_effort = kwargs.get("reasoning", getattr(request, "reasoning", None)) or self.reasoning
-        if reasoning_effort:
-            # DEBUG: Log reasoning configuration
-            logger.info(f"[PROVIDER] Setting reasoning: effort={reasoning_effort}, summary={self.reasoning_summary}")
-            params["reasoning"] = {
-                "effort": reasoning_effort,
-                "summary": self.reasoning_summary,  # Verbosity: auto|concise|detailed
+        # Phase 2: Reasoning parameter precedence chain
+        # kwargs["reasoning"] > request.reasoning_effort > config default > None
+        reasoning_param = kwargs.get("reasoning", getattr(request, "reasoning", None))
+        if reasoning_param is None and request.reasoning_effort:
+            reasoning_param = {
+                "effort": request.reasoning_effort,
+                "summary": self.reasoning_summary,
             }
+        if reasoning_param is None:
+            reasoning_param = self.reasoning
+        if reasoning_param is not None:
+            # Handle both dict format ({"effort": "low", "summary": "auto"}) and string format ("low")
+            if isinstance(reasoning_param, dict):
+                params["reasoning"] = {
+                    "effort": reasoning_param.get("effort", "medium"),
+                    "summary": reasoning_param.get("summary", self.reasoning_summary),
+                }
+            else:
+                params["reasoning"] = {
+                    "effort": reasoning_param,
+                    "summary": self.reasoning_summary,  # Verbosity: auto|concise|detailed
+                }
+            logger.info(f"[PROVIDER] Setting reasoning: {params['reasoning']}")
 
         # CRITICAL: Always request encrypted_content with store=False for stateless reasoning preservation
         # This is separate from reasoning effort - we need encrypted content even if effort not explicitly set
         if not store_enabled:
             params["include"] = kwargs.get("include", ["reasoning.encrypted_content"])
-            logger.debug("[PROVIDER] Requesting encrypted_content (store=False, enables stateless reasoning)")
+            logger.debug(
+                "[PROVIDER] Requesting encrypted_content (store=False, enables stateless reasoning)"
+            )
 
         # Add tools if provided
         if request.tools:
@@ -532,18 +618,27 @@ class VLLMProvider:
         if thinking_enabled:
             if "reasoning" not in params:
                 params["reasoning"] = {
-                    "effort": kwargs.get("reasoning_effort") or self.config.get("reasoning_effort", "high"),
+                    "effort": kwargs.get("reasoning_effort")
+                    or self.config.get("reasoning_effort", "high"),
                     "summary": self.reasoning_summary,  # Verbosity: auto|concise|detailed
                 }
 
-            budget_tokens = kwargs.get("thinking_budget_tokens") or self.config.get("thinking_budget_tokens") or 0
-            buffer_tokens = kwargs.get("thinking_budget_buffer") or self.config.get("thinking_budget_buffer", 1024)
+            budget_tokens = (
+                kwargs.get("thinking_budget_tokens")
+                or self.config.get("thinking_budget_tokens")
+                or 0
+            )
+            buffer_tokens = kwargs.get("thinking_budget_buffer") or self.config.get(
+                "thinking_budget_buffer", 1024
+            )
 
             if budget_tokens:
                 thinking_budget = budget_tokens
                 target_tokens = budget_tokens + buffer_tokens
                 if params.get("max_output_tokens"):
-                    params["max_output_tokens"] = max(params["max_output_tokens"], target_tokens)
+                    params["max_output_tokens"] = max(
+                        params["max_output_tokens"], target_tokens
+                    )
                 else:
                     params["max_output_tokens"] = target_tokens
 
@@ -594,9 +689,117 @@ class VLLMProvider:
 
         start_time = time.time()
 
-        # Call provider API
+        # Phase 2: Call provider API with retry loop and error translation
         try:
-            response = await asyncio.wait_for(self.client.responses.create(**params), timeout=self.timeout)
+            for attempt in range(1, self._max_retries + 2):
+                try:
+                    # Phase 2 inner try: translate native SDK errors to kernel types
+                    try:
+                        response = await asyncio.wait_for(
+                            self.client.responses.create(**params), timeout=self.timeout
+                        )
+                    except openai.RateLimitError as e:
+                        retry_after = None
+                        if hasattr(e, "response") and e.response is not None:
+                            ra_header = e.response.headers.get("retry-after")
+                            if ra_header:
+                                try:
+                                    retry_after = float(ra_header)
+                                except (ValueError, TypeError):
+                                    pass
+                        raise kernel_errors.RateLimitError(
+                            str(e),
+                            provider=self.name,
+                            status_code=429,
+                            retryable=True,
+                            retry_after=retry_after,
+                        ) from e
+                    except openai.AuthenticationError as e:
+                        raise kernel_errors.AuthenticationError(
+                            str(e),
+                            provider=self.name,
+                            status_code=getattr(e, "status_code", 401),
+                        ) from e
+                    except openai.BadRequestError as e:
+                        msg = str(e).lower()
+                        if (
+                            "context length" in msg
+                            or "too many tokens" in msg
+                            or "maximum context" in msg
+                        ):
+                            raise kernel_errors.ContextLengthError(
+                                str(e),
+                                provider=self.name,
+                                status_code=400,
+                            ) from e
+                        elif (
+                            "content filter" in msg
+                            or "safety" in msg
+                            or "blocked" in msg
+                        ):
+                            raise kernel_errors.ContentFilterError(
+                                str(e),
+                                provider=self.name,
+                                status_code=400,
+                            ) from e
+                        else:
+                            raise kernel_errors.InvalidRequestError(
+                                str(e),
+                                provider=self.name,
+                                status_code=400,
+                            ) from e
+                    except openai.APIStatusError as e:
+                        status = getattr(e, "status_code", 500)
+                        if status >= 500:
+                            raise kernel_errors.ProviderUnavailableError(
+                                str(e),
+                                provider=self.name,
+                                status_code=status,
+                                retryable=True,
+                            ) from e
+                        raise kernel_errors.LLMError(
+                            str(e),
+                            provider=self.name,
+                            status_code=status,
+                            retryable=False,
+                        ) from e
+                    except asyncio.TimeoutError as e:
+                        raise kernel_errors.LLMTimeoutError(
+                            f"Request timed out after {self.timeout}s",
+                            provider=self.name,
+                            retryable=True,
+                        ) from e
+                    except kernel_errors.LLMError:
+                        raise  # Already translated, don't double-wrap
+                    except Exception as e:
+                        raise kernel_errors.LLMError(
+                            str(e) or f"{type(e).__name__}: (no message)",
+                            provider=self.name,
+                            retryable=True,
+                        ) from e
+
+                    break  # Success — exit retry loop
+
+                except kernel_errors.LLMError as e:
+                    if not e.retryable or attempt > self._max_retries:
+                        raise
+                    retry_after = getattr(e, "retry_after", None)
+                    if retry_after is not None and retry_after > self._max_retry_delay:
+                        raise  # Don't silently wait minutes — fail fast
+                    delay = self._calculate_retry_delay(retry_after, attempt)
+                    # Emit provider:retry event for observability
+                    if self.coordinator and hasattr(self.coordinator, "hooks"):
+                        await self.coordinator.hooks.emit(
+                            "provider:retry",
+                            {
+                                "provider": self.name,
+                                "attempt": attempt,
+                                "delay": delay,
+                                "error_type": type(e).__name__,
+                            },
+                        )
+                    await asyncio.sleep(delay)
+
             elapsed_ms = int((time.time() - start_time) * 1000)
 
             # Apply token accounting for GPT-OSS models (vLLM bug returns zeros)
@@ -606,7 +809,12 @@ class VLLMProvider:
             logger.info("[PROVIDER] Received response from %s API", self.api_label)
 
             # RAW level: Complete response object from OpenAI API (if debug AND raw_debug enabled)
-            if self.coordinator and hasattr(self.coordinator, "hooks") and self.debug and self.raw_debug:
+            if (
+                self.coordinator
+                and hasattr(self.coordinator, "hooks")
+                and self.debug
+                and self.raw_debug
+            ):
                 await self.coordinator.hooks.emit(
                     "llm:response:raw",
                     {
@@ -619,7 +827,9 @@ class VLLMProvider:
             # Handle incomplete responses via auto-continuation
             # OpenAI Responses API may return status="incomplete" with reason like "max_output_tokens"
             # We automatically continue until complete to provide seamless experience
-            accumulated_output = list(response.output) if hasattr(response, "output") else []
+            accumulated_output = (
+                list(response.output) if hasattr(response, "output") else []
+            )
             final_response = response
             continuation_count = 0
 
@@ -659,9 +869,9 @@ class VLLMProvider:
                     )
 
                 # Build continuation params using input-based pattern (stateless-compatible)
-                # Instead of previous_response_id (requires store:true), we include the
-                # accumulated output in the input to preserve context
-                continuation_input = self._build_continuation_input(all_messages_for_conversion, accumulated_output)
+                continuation_input = self._build_continuation_input(
+                    all_messages_for_conversion, accumulated_output
+                )
 
                 continue_params = {
                     "model": params["model"],
@@ -682,7 +892,9 @@ class VLLMProvider:
                 if "tools" in params:
                     continue_params["tools"] = params["tools"]
                     continue_params["tool_choice"] = params.get("tool_choice", "auto")
-                    continue_params["parallel_tool_calls"] = params.get("parallel_tool_calls", True)
+                    continue_params["parallel_tool_calls"] = params.get(
+                        "parallel_tool_calls", True
+                    )
                 if "store" in params:
                     continue_params["store"] = params["store"]
 
@@ -701,7 +913,12 @@ class VLLMProvider:
                         accumulated_output.extend(final_response.output)
 
                     # Emit raw debug for continuation if enabled
-                    if self.coordinator and hasattr(self.coordinator, "hooks") and self.debug and self.raw_debug:
+                    if (
+                        self.coordinator
+                        and hasattr(self.coordinator, "hooks")
+                        and self.debug
+                        and self.raw_debug
+                    ):
                         await self.coordinator.hooks.emit(
                             "llm:response:raw",
                             {
@@ -748,10 +965,15 @@ class VLLMProvider:
                     {
                         "provider": self.name,
                         "model": params["model"],
-                        "usage": {"input": usage_counts["input"], "output": usage_counts["output"]},
+                        "usage": {
+                            "input": usage_counts["input"],
+                            "output": usage_counts["output"],
+                        },
                         "status": "ok",
                         "duration_ms": elapsed_ms,
-                        "continuation_count": continuation_count if continuation_count > 0 else None,
+                        "continuation_count": continuation_count
+                        if continuation_count > 0
+                        else None,
                     },
                 )
 
@@ -766,7 +988,9 @@ class VLLMProvider:
                             "response": self._truncate_values(response_dict),
                             "status": "ok",
                             "duration_ms": elapsed_ms,
-                            "continuation_count": continuation_count if continuation_count > 0 else None,
+                            "continuation_count": continuation_count
+                            if continuation_count > 0
+                            else None,
                         },
                     )
 
@@ -780,11 +1004,9 @@ class VLLMProvider:
             # Use existing conversion for normal (non-continued) responses
             return self._convert_to_chat_response(response)
 
-        except TimeoutError:
-            # Handle timeout specifically - TimeoutError has empty str() representation
+        except kernel_errors.LLMError as e:
             elapsed_ms = int((time.time() - start_time) * 1000)
-            error_msg = f"Request timed out after {self.timeout}s"
-            logger.error("[PROVIDER] %s API error: %s", self.api_label, error_msg)
+            logger.error("[PROVIDER] %s API error: %s", self.api_label, str(e))
 
             # Emit error event
             if self.coordinator and hasattr(self.coordinator, "hooks"):
@@ -793,12 +1015,12 @@ class VLLMProvider:
                     {
                         "status": "error",
                         "duration_ms": elapsed_ms,
-                        "error": error_msg,
+                        "error": str(e),
                         "provider": self.name,
                         "model": params["model"],
                     },
                 )
-            raise TimeoutError(error_msg) from None
+            raise
 
         except Exception as e:
             elapsed_ms = int((time.time() - start_time) * 1000)
@@ -818,9 +1040,6 @@ class VLLMProvider:
                         "model": params["model"],
                     },
                 )
-            # Re-raise with meaningful message if original was empty
-            if not str(e):
-                raise type(e)(error_msg) from e
             raise
 
     def _extract_text_from_content(self, content: Any) -> str:
@@ -891,7 +1110,11 @@ class VLLMProvider:
                     if tool_call_id:
                         # Native format: function_call_output with call_id for explicit correlation
                         # vLLM Responses API supports this format for precise tool result matching
-                        output_str = tool_content if isinstance(tool_content, str) else json.dumps(tool_content)
+                        output_str = (
+                            tool_content
+                            if isinstance(tool_content, str)
+                            else json.dumps(tool_content)
+                        )
                         openai_messages.append(
                             {
                                 "type": "function_call_output",
@@ -905,7 +1128,12 @@ class VLLMProvider:
                             f"Tool result missing tool_call_id for '{tool_name}', using text fallback. "
                             "This may reduce model accuracy for multi-tool scenarios."
                         )
-                        openai_messages.append({"role": "user", "content": f"[Tool: {tool_name}]\n{tool_content}"})
+                        openai_messages.append(
+                            {
+                                "role": "user",
+                                "content": f"[Tool: {tool_name}]\n{tool_content}",
+                            }
+                        )
                     i += 1
                 continue
 
@@ -954,7 +1182,9 @@ class VLLMProvider:
                                 if isinstance(tc_input, str):
                                     tc_args_str = tc_input
                                 else:
-                                    tc_args_str = json.dumps(tc_input) if tc_input else "{}"
+                                    tc_args_str = (
+                                        json.dumps(tc_input) if tc_input else "{}"
+                                    )
                                 if tc_id and tc_name:
                                     function_call_items.append(
                                         {
@@ -975,10 +1205,16 @@ class VLLMProvider:
                                         "type": "reasoning",  # Required: must be "reasoning"
                                         "id": f"local_{uuid.uuid4().hex[:16]}",  # Required: unique ID
                                         "summary": [  # Required: summary array
-                                            {"type": "summary_text", "text": thinking_text}
+                                            {
+                                                "type": "summary_text",
+                                                "text": thinking_text,
+                                            }
                                         ],
                                         "content": [  # Required: reasoning text content
-                                            {"type": "reasoning_text", "text": thinking_text}
+                                            {
+                                                "type": "reasoning_text",
+                                                "text": thinking_text,
+                                            }
                                         ],
                                     }
                                     reasoning_items_to_add.append(reasoning_item)
@@ -994,7 +1230,9 @@ class VLLMProvider:
                                 if isinstance(tc_input, str):
                                     tc_args_str = tc_input
                                 else:
-                                    tc_args_str = json.dumps(tc_input) if tc_input else "{}"
+                                    tc_args_str = (
+                                        json.dumps(tc_input) if tc_input else "{}"
+                                    )
                                 if tc_id and tc_name:
                                     function_call_items.append(
                                         {
@@ -1006,7 +1244,9 @@ class VLLMProvider:
                                             "status": None,
                                         }
                                     )
-                            elif block.type == "thinking" and hasattr(block, "thinking"):
+                            elif block.type == "thinking" and hasattr(
+                                block, "thinking"
+                            ):
                                 # Extract reasoning text for re-insertion
                                 thinking_text = block.thinking
                                 if thinking_text:
@@ -1015,10 +1255,16 @@ class VLLMProvider:
                                         "type": "reasoning",  # Required: must be "reasoning"
                                         "id": f"local_{uuid.uuid4().hex[:16]}",  # Required: unique ID
                                         "summary": [  # Required: summary array
-                                            {"type": "summary_text", "text": thinking_text}
+                                            {
+                                                "type": "summary_text",
+                                                "text": thinking_text,
+                                            }
                                         ],
                                         "content": [  # Required: reasoning text content
-                                            {"type": "reasoning_text", "text": thinking_text}
+                                            {
+                                                "type": "reasoning_text",
+                                                "text": thinking_text,
+                                            }
                                         ],
                                     }
                                     reasoning_items_to_add.append(reasoning_item)
@@ -1045,7 +1291,9 @@ class VLLMProvider:
                 # Only add assistant message if there's text content
                 if text_parts:
                     combined_text = "\n".join(text_parts)
-                    openai_messages.append({"role": "assistant", "content": combined_text})
+                    openai_messages.append(
+                        {"role": "assistant", "content": combined_text}
+                    )
 
                 i += 1
 
@@ -1103,7 +1351,6 @@ class VLLMProvider:
         Returns:
             ChatResponse with content blocks
         """
-        from amplifier_core.message_models import ReasoningBlock as ResponseReasoningBlock
         from amplifier_core.message_models import TextBlock
         from amplifier_core.message_models import ThinkingBlock
         from amplifier_core.message_models import ToolCall
@@ -1126,11 +1373,19 @@ class VLLMProvider:
                     block_content = getattr(block, "content", [])
                     if isinstance(block_content, list):
                         for content_item in block_content:
-                            if hasattr(content_item, "type") and content_item.type == "output_text":
+                            if (
+                                hasattr(content_item, "type")
+                                and content_item.type == "output_text"
+                            ):
                                 text = getattr(content_item, "text", "")
                                 content_blocks.append(TextBlock(text=text))
                                 text_accumulator.append(text)
-                                event_blocks.append(TextContent(text=text, raw=getattr(content_item, "raw", None)))
+                                event_blocks.append(
+                                    TextContent(
+                                        text=text,
+                                        raw=getattr(content_item, "raw", None),
+                                    )
+                                )
                     elif isinstance(block_content, str):
                         content_blocks.append(TextBlock(text=block_content))
                         text_accumulator.append(block_content)
@@ -1146,9 +1401,14 @@ class VLLMProvider:
                         # Extract reasoning_text items from content array
                         texts = []
                         for item in block_content:
-                            if isinstance(item, dict) and item.get("type") == "reasoning_text":
+                            if (
+                                isinstance(item, dict)
+                                and item.get("type") == "reasoning_text"
+                            ):
                                 texts.append(item.get("text", ""))
-                            elif hasattr(item, "type") and item.type == "reasoning_text":  # type: ignore[union-attr]
+                            elif (
+                                hasattr(item, "type") and item.type == "reasoning_text"
+                            ):  # type: ignore[union-attr]
                                 texts.append(getattr(item, "text", ""))
                         if texts:
                             reasoning_text = "\n".join(texts)
@@ -1178,14 +1438,20 @@ class VLLMProvider:
                         try:
                             tool_input = json.loads(tool_input)
                         except json.JSONDecodeError:
-                            logger.debug("Failed to decode tool call arguments: %s", tool_input)
+                            logger.debug(
+                                "Failed to decode tool call arguments: %s", tool_input
+                            )
                     if tool_input is None:
                         tool_input = {}
                     # Ensure tool_input is dict after json.loads or default
                     if not isinstance(tool_input, dict):
                         tool_input = {}
-                    content_blocks.append(ToolCallBlock(id=tool_id, name=tool_name, input=tool_input))
-                    tool_calls.append(ToolCall(id=tool_id, name=tool_name, arguments=tool_input))
+                    content_blocks.append(
+                        ToolCallBlock(id=tool_id, name=tool_name, input=tool_input)
+                    )
+                    tool_calls.append(
+                        ToolCall(id=tool_id, name=tool_name, arguments=tool_input)
+                    )
             else:
                 # Dictionary format
                 block_type = block.get("type")
@@ -1198,7 +1464,9 @@ class VLLMProvider:
                                 text = content_item.get("text", "")
                                 content_blocks.append(TextBlock(text=text))
                                 text_accumulator.append(text)
-                                event_blocks.append(TextContent(text=text, raw=content_item))
+                                event_blocks.append(
+                                    TextContent(text=text, raw=content_item)
+                                )
                     elif isinstance(block_content, str):
                         content_blocks.append(TextBlock(text=block_content))
                         text_accumulator.append(block_content)
@@ -1214,7 +1482,10 @@ class VLLMProvider:
                         # Extract reasoning_text items from content array
                         texts = []
                         for item in block_content:
-                            if isinstance(item, dict) and item.get("type") == "reasoning_text":
+                            if (
+                                isinstance(item, dict)
+                                and item.get("type") == "reasoning_text"
+                            ):
                                 texts.append(item.get("text", ""))
                         if texts:
                             reasoning_text = "\n".join(texts)
@@ -1244,15 +1515,25 @@ class VLLMProvider:
                         try:
                             tool_input = json.loads(tool_input)
                         except json.JSONDecodeError:
-                            logger.debug("Failed to decode tool call arguments: %s", tool_input)
+                            logger.debug(
+                                "Failed to decode tool call arguments: %s", tool_input
+                            )
                     if tool_input is None:
                         tool_input = {}
                     # Ensure tool_input is dict after json.loads or default
                     if not isinstance(tool_input, dict):
                         tool_input = {}
-                    content_blocks.append(ToolCallBlock(id=tool_id, name=tool_name, input=tool_input))
-                    tool_calls.append(ToolCall(id=tool_id, name=tool_name, arguments=tool_input))
-                    event_blocks.append(ToolCallContent(id=tool_id, name=tool_name, arguments=tool_input, raw=block))
+                    content_blocks.append(
+                        ToolCallBlock(id=tool_id, name=tool_name, input=tool_input)
+                    )
+                    tool_calls.append(
+                        ToolCall(id=tool_id, name=tool_name, arguments=tool_input)
+                    )
+                    event_blocks.append(
+                        ToolCallContent(
+                            id=tool_id, name=tool_name, arguments=tool_input, raw=block
+                        )
+                    )
 
         # Extract usage counts
         usage_obj = response.usage if hasattr(response, "usage") else None
@@ -1264,10 +1545,26 @@ class VLLMProvider:
                 usage_counts["output"] = usage_obj.output_tokens
             usage_counts["total"] = usage_counts["input"] + usage_counts["output"]
 
+        # Phase 2: Extract reasoning_tokens from output_tokens_details
+        reasoning_tokens = None
+        if usage_obj and hasattr(usage_obj, "output_tokens_details"):
+            details = usage_obj.output_tokens_details
+            if details and hasattr(details, "reasoning_tokens"):
+                reasoning_tokens = details.reasoning_tokens
+
+        # Extract cache_read_tokens from input_tokens_details
+        cache_read_tokens = None
+        if usage_obj and hasattr(usage_obj, "input_tokens_details"):
+            details = usage_obj.input_tokens_details
+            if details and hasattr(details, "cached_tokens"):
+                cache_read_tokens = details.cached_tokens  # 0 is a valid measurement
+
         usage = Usage(
             input_tokens=usage_counts["input"],
             output_tokens=usage_counts["output"],
             total_tokens=usage_counts["total"],
+            reasoning_tokens=reasoning_tokens,
+            cache_read_tokens=cache_read_tokens,
         )
 
         combined_text = "\n\n".join(text_accumulator).strip()
@@ -1288,16 +1585,22 @@ class VLLMProvider:
                 incomplete_details = getattr(response, "incomplete_details", None)
                 if incomplete_details:
                     if isinstance(incomplete_details, dict):
-                        metadata[METADATA_INCOMPLETE_REASON] = incomplete_details.get("reason")
+                        metadata[METADATA_INCOMPLETE_REASON] = incomplete_details.get(
+                            "reason"
+                        )
                     elif hasattr(incomplete_details, "reason"):
                         metadata[METADATA_INCOMPLETE_REASON] = incomplete_details.reason
 
         # DEBUG: Log what we're returning
-        logger.info(f"[PROVIDER] Returning ChatResponse with {len(content_blocks)} content blocks")
+        logger.info(
+            f"[PROVIDER] Returning ChatResponse with {len(content_blocks)} content blocks"
+        )
         for i, block in enumerate(content_blocks):
             block_type = block.type if hasattr(block, "type") else "unknown"
             has_content = hasattr(block, "content") and block.content is not None
-            logger.info(f"[PROVIDER]   Block {i}: type={block_type}, has_content_field={has_content}")
+            logger.info(
+                f"[PROVIDER]   Block {i}: type={block_type}, has_content_field={has_content}"
+            )
 
         chat_response = VLLMChatResponse(
             content=content_blocks,

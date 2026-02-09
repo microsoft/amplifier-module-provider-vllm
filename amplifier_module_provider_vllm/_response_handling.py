@@ -65,11 +65,18 @@ def convert_response_with_accumulated_output(
                 block_content = getattr(block, "content", [])
                 if isinstance(block_content, list):
                     for content_item in block_content:
-                        if hasattr(content_item, "type") and content_item.type == "output_text":
+                        if (
+                            hasattr(content_item, "type")
+                            and content_item.type == "output_text"
+                        ):
                             text = getattr(content_item, "text", "")
                             content_blocks.append(TextBlock(text=text))
                             text_accumulator.append(text)
-                            event_blocks.append(TextContent(text=text, raw=getattr(content_item, "raw", None)))
+                            event_blocks.append(
+                                TextContent(
+                                    text=text, raw=getattr(content_item, "raw", None)
+                                )
+                            )
                 elif isinstance(block_content, str):
                     content_blocks.append(TextBlock(text=block_content))
                     text_accumulator.append(block_content)
@@ -85,7 +92,10 @@ def convert_response_with_accumulated_output(
                     # Extract reasoning_text items from content array
                     texts = []
                     for item in block_content:
-                        if isinstance(item, dict) and item.get("type") == "reasoning_text":
+                        if (
+                            isinstance(item, dict)
+                            and item.get("type") == "reasoning_text"
+                        ):
                             texts.append(item.get("text", ""))
                         elif hasattr(item, "type") and item.type == "reasoning_text":  # type: ignore[union-attr]
                             texts.append(getattr(item, "text", ""))
@@ -115,15 +125,23 @@ def convert_response_with_accumulated_output(
                     try:
                         tool_input = json.loads(tool_input)
                     except json.JSONDecodeError:
-                        logger.debug("Failed to decode tool call arguments: %s", tool_input)
+                        logger.debug(
+                            "Failed to decode tool call arguments: %s", tool_input
+                        )
                 if tool_input is None:
                     tool_input = {}
                 # Ensure tool_input is dict after json.loads or default
                 if not isinstance(tool_input, dict):
                     tool_input = {}
-                content_blocks.append(ToolCallBlock(id=tool_id, name=tool_name, input=tool_input))
-                tool_calls.append(ToolCall(id=tool_id, name=tool_name, arguments=tool_input))
-                event_blocks.append(ToolCallContent(id=tool_id, name=tool_name, arguments=tool_input))
+                content_blocks.append(
+                    ToolCallBlock(id=tool_id, name=tool_name, input=tool_input)
+                )
+                tool_calls.append(
+                    ToolCall(id=tool_id, name=tool_name, arguments=tool_input)
+                )
+                event_blocks.append(
+                    ToolCallContent(id=tool_id, name=tool_name, arguments=tool_input)
+                )
 
         else:
             # Dictionary format
@@ -137,7 +155,9 @@ def convert_response_with_accumulated_output(
                             text = content_item.get("text", "")
                             content_blocks.append(TextBlock(text=text))
                             text_accumulator.append(text)
-                            event_blocks.append(TextContent(text=text, raw=content_item))
+                            event_blocks.append(
+                                TextContent(text=text, raw=content_item)
+                            )
                 elif isinstance(block_content, str):
                     content_blocks.append(TextBlock(text=block_content))
                     text_accumulator.append(block_content)
@@ -153,7 +173,10 @@ def convert_response_with_accumulated_output(
                     # Extract reasoning_text items from content array
                     texts = []
                     for item in block_content:
-                        if isinstance(item, dict) and item.get("type") == "reasoning_text":
+                        if (
+                            isinstance(item, dict)
+                            and item.get("type") == "reasoning_text"
+                        ):
                             texts.append(item.get("text", ""))
                     if texts:
                         reasoning_text = "\n".join(texts)
@@ -181,15 +204,25 @@ def convert_response_with_accumulated_output(
                     try:
                         tool_input = json.loads(tool_input)
                     except json.JSONDecodeError:
-                        logger.debug("Failed to decode tool call arguments: %s", tool_input)
+                        logger.debug(
+                            "Failed to decode tool call arguments: %s", tool_input
+                        )
                 if tool_input is None:
                     tool_input = {}
                 # Ensure tool_input is dict after json.loads or default
                 if not isinstance(tool_input, dict):
                     tool_input = {}
-                content_blocks.append(ToolCallBlock(id=tool_id, name=tool_name, input=tool_input))
-                tool_calls.append(ToolCall(id=tool_id, name=tool_name, arguments=tool_input))
-                event_blocks.append(ToolCallContent(id=tool_id, name=tool_name, arguments=tool_input, raw=block))
+                content_blocks.append(
+                    ToolCallBlock(id=tool_id, name=tool_name, input=tool_input)
+                )
+                tool_calls.append(
+                    ToolCall(id=tool_id, name=tool_name, arguments=tool_input)
+                )
+                event_blocks.append(
+                    ToolCallContent(
+                        id=tool_id, name=tool_name, arguments=tool_input, raw=block
+                    )
+                )
 
     # Extract usage from final response
     usage_obj = final_response.usage if hasattr(final_response, "usage") else None
@@ -201,10 +234,26 @@ def convert_response_with_accumulated_output(
             usage_counts["output"] = usage_obj.output_tokens
         usage_counts["total"] = usage_counts["input"] + usage_counts["output"]
 
+    # Phase 2: Extract reasoning_tokens from output_tokens_details
+    reasoning_tokens = None
+    if usage_obj and hasattr(usage_obj, "output_tokens_details"):
+        details = usage_obj.output_tokens_details
+        if details and hasattr(details, "reasoning_tokens"):
+            reasoning_tokens = details.reasoning_tokens
+
+    # Extract cache_read_tokens from input_tokens_details
+    cache_read_tokens = None
+    if usage_obj and hasattr(usage_obj, "input_tokens_details"):
+        details = usage_obj.input_tokens_details
+        if details and hasattr(details, "cached_tokens"):
+            cache_read_tokens = details.cached_tokens  # 0 is a valid measurement
+
     usage = Usage(
         input_tokens=usage_counts["input"],
         output_tokens=usage_counts["output"],
         total_tokens=usage_counts["total"],
+        reasoning_tokens=reasoning_tokens,
+        cache_read_tokens=cache_read_tokens,
     )
 
     # Build metadata with provider-specific state
@@ -223,7 +272,9 @@ def convert_response_with_accumulated_output(
             incomplete_details = getattr(final_response, "incomplete_details", None)
             if incomplete_details:
                 if isinstance(incomplete_details, dict):
-                    metadata[METADATA_INCOMPLETE_REASON] = incomplete_details.get("reason")
+                    metadata[METADATA_INCOMPLETE_REASON] = incomplete_details.get(
+                        "reason"
+                    )
                 elif hasattr(incomplete_details, "reason"):
                     metadata[METADATA_INCOMPLETE_REASON] = incomplete_details.reason
 
