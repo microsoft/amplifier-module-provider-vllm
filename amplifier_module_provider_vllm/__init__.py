@@ -569,14 +569,14 @@ class VLLMProvider:
         # Phase 2: Reasoning parameter precedence chain
         # kwargs["reasoning"] > request.reasoning_effort > config default > None
         reasoning_param = kwargs.get("reasoning", getattr(request, "reasoning", None))
-        if not reasoning_param and request.reasoning_effort:
+        if reasoning_param is None and request.reasoning_effort:
             reasoning_param = {
                 "effort": request.reasoning_effort,
                 "summary": self.reasoning_summary,
             }
-        if not reasoning_param:
+        if reasoning_param is None:
             reasoning_param = self.reasoning
-        if reasoning_param:
+        if reasoning_param is not None:
             # Handle both dict format ({"effort": "low", "summary": "auto"}) and string format ("low")
             if isinstance(reasoning_param, dict):
                 params["reasoning"] = {
@@ -1557,7 +1557,7 @@ class VLLMProvider:
         if usage_obj and hasattr(usage_obj, "input_tokens_details"):
             details = usage_obj.input_tokens_details
             if details and hasattr(details, "cached_tokens"):
-                cache_read_tokens = details.cached_tokens or None
+                cache_read_tokens = details.cached_tokens  # 0 is a valid measurement
 
         usage = Usage(
             input_tokens=usage_counts["input"],
