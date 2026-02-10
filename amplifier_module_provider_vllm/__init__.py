@@ -828,7 +828,9 @@ class VLLMProvider:
             # OpenAI Responses API may return status="incomplete" with reason like "max_output_tokens"
             # We automatically continue until complete to provide seamless experience
             accumulated_output = (
-                list(response.output) if hasattr(response, "output") else []
+                list(response.output)
+                if hasattr(response, "output") and response.output is not None
+                else []
             )
             final_response = response
             continuation_count = 0
@@ -909,7 +911,10 @@ class VLLMProvider:
                     elapsed_ms += continue_elapsed
 
                     # Accumulate output from continuation
-                    if hasattr(final_response, "output"):
+                    if (
+                        hasattr(final_response, "output")
+                        and final_response.output is not None
+                    ):
                         accumulated_output.extend(final_response.output)
 
                     # Emit raw debug for continuation if enabled
@@ -1363,7 +1368,7 @@ class VLLMProvider:
         text_accumulator: list[str] = []
 
         # Parse output blocks
-        for block in response.output:
+        for block in response.output or []:
             # Handle both SDK objects and dictionaries
             if hasattr(block, "type"):
                 block_type = block.type
