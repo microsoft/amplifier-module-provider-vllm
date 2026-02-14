@@ -121,24 +121,26 @@ def test_non_retryable_error_not_retried():
     assert provider.client.responses.create.await_count == 1
 
 
-def test_retry_after_exceeds_max_delay_raises_immediately():
-    """If retry_after > max_retry_delay, raise immediately (fail fast)."""
-    provider = _make_provider(max_retry_delay=10.0)
+def test_retry_after_honored_by_shared_utility():
+    """RateLimitError with retry_after is honored by shared retry utility (capped at max_delay)."""
+    provider = _make_provider(max_retry_delay=60.0, max_retries=1)
     native = openai.RateLimitError(
         "Rate limit",
-        response=_mock_httpx_response(429, headers={"retry-after": "120"}),
+        response=_mock_httpx_response(429, headers={"retry-after": "30"}),
         body=None,
     )
-    provider.client.responses.create = AsyncMock(side_effect=native)
+    # Fail once with retry_after, then succeed
+    provider.client.responses.create = AsyncMock(side_effect=[native, DummyResponse()])
 
-    import pytest
 
-    with pytest.raises(kernel_errors.RateLimitError) as exc_info:
-        asyncio.run(provider.complete(_simple_request()))
+    with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+        result = asyncio.run(provider.complete(_simple_request()))
 
-    # retry_after=120 > max_retry_delay=10 → only 1 attempt
-    assert provider.client.responses.create.await_count == 1
-    assert exc_info.value.retry_after == 120.0
+    assert result is not None
+    assert provider.client.responses.create.await_count == 2
+    # The sleep delay should respect retry_after (at least ~30s minus jitter)
+    sleep_delay = mock_sleep.call_args[0][0]
+    assert sleep_delay >= 20.0  # retry_after=30 minus possible jitter
 
 
 def test_provider_retry_event_emitted():
