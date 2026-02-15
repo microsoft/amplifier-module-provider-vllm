@@ -12,7 +12,6 @@ import asyncio
 import json
 import logging
 import os
-import random
 import time
 import uuid
 from typing import Any
@@ -26,9 +25,11 @@ from amplifier_core import TextContent
 from amplifier_core import ThinkingContent
 from amplifier_core import ToolCallContent
 from amplifier_core import llm_errors as kernel_errors
+from amplifier_core.events import PROVIDER_RETRY
 from amplifier_core.message_models import ChatRequest
 from amplifier_core.message_models import ChatResponse
 from amplifier_core.message_models import ToolCall
+from amplifier_core.utils.retry import RetryConfig, retry_with_backoff
 from openai import AsyncOpenAI
 
 from ._constants import DEFAULT_DEBUG_TRUNCATE_LENGTH
@@ -136,11 +137,18 @@ class VLLMProvider:
         # Provider priority for selection (lower = higher priority)
         self.priority = self.config.get("priority", 100)
 
-        # Phase 2: Retry configuration
-        self._max_retries = int(self.config.get("max_retries", 5))
-        self._min_retry_delay = float(self.config.get("min_retry_delay", 1.0))
-        self._max_retry_delay = float(self.config.get("max_retry_delay", 60.0))
-        self._retry_jitter = bool(self.config.get("retry_jitter", True))
+        # Retry configuration — delegates to shared retry_with_backoff() from amplifier-core.
+        # Backward compat: retry_jitter used to be bool (True/False). Now it's a float
+        # for RetryConfig.jitter (0.0-1.0). Accept both: True→0.2, False→0.0, float→as-is.
+        jitter_val = self.config.get("retry_jitter", 0.2)
+        if isinstance(jitter_val, bool):
+            jitter_val = 0.2 if jitter_val else 0.0
+        self._retry_config = RetryConfig(
+            max_retries=int(self.config.get("max_retries", 5)),
+            min_delay=float(self.config.get("min_retry_delay", 1.0)),
+            max_delay=float(self.config.get("max_retry_delay", 60.0)),
+            jitter=float(jitter_val),
+        )
 
         # Track tool call IDs that have been repaired with synthetic results.
         # This prevents infinite loops when the same missing tool results are
@@ -160,25 +168,6 @@ class VLLMProvider:
                 max_retries=0,  # Phase 2: Disable SDK retries — we handle retry ourselves
             )
         return self._client
-
-    def _calculate_retry_delay(self, retry_after: float | None, attempt: int) -> float:
-        """Calculate retry delay with exponential backoff and optional jitter.
-
-        Args:
-            retry_after: Server-suggested delay (from Retry-After header), or None.
-            attempt: Current attempt number (1-based).
-
-        Returns:
-            Delay in seconds before the next retry.
-        """
-        if retry_after is not None and retry_after > 0:
-            delay = retry_after
-        else:
-            delay = self._min_retry_delay * (2 ** (attempt - 1))
-        delay = min(delay, self._max_retry_delay)
-        if self._retry_jitter:
-            delay *= random.uniform(0.8, 1.2)
-        return delay
 
     def get_info(self) -> ProviderInfo:
         """Get provider metadata."""
@@ -689,116 +678,133 @@ class VLLMProvider:
 
         start_time = time.time()
 
-        # Phase 2: Call provider API with retry loop and error translation
+        # Call provider API with shared retry_with_backoff from amplifier-core.
+        # Error translation happens inside _do_complete() so that retry_with_backoff
+        # sees LLMError (and checks retryable) rather than raw SDK exceptions.
+
+        async def _do_complete():
+            """Single API call attempt with SDK → kernel error translation."""
+            try:
+                return await asyncio.wait_for(
+                    self.client.responses.create(**params), timeout=self.timeout
+                )
+            except openai.RateLimitError as e:
+                retry_after = None
+                if hasattr(e, "response") and e.response is not None:
+                    ra_header = e.response.headers.get("retry-after")
+                    if ra_header:
+                        try:
+                            retry_after = float(ra_header)
+                        except (ValueError, TypeError):
+                            pass
+                # Fail-fast: if retry_after exceeds max_delay, mark non-retryable
+                # so retry_with_backoff raises immediately instead of sleeping.
+                retryable = True
+                if (
+                    retry_after is not None
+                    and retry_after > self._retry_config.max_delay
+                ):
+                    retryable = False
+                raise kernel_errors.RateLimitError(
+                    str(e),
+                    provider=self.name,
+                    status_code=429,
+                    retryable=retryable,
+                    retry_after=retry_after,
+                ) from e
+            except openai.AuthenticationError as e:
+                raise kernel_errors.AuthenticationError(
+                    str(e),
+                    provider=self.name,
+                    status_code=getattr(e, "status_code", 401),
+                ) from e
+            except openai.BadRequestError as e:
+                msg = str(e).lower()
+                if (
+                    "context length" in msg
+                    or "too many tokens" in msg
+                    or "maximum context" in msg
+                ):
+                    raise kernel_errors.ContextLengthError(
+                        str(e),
+                        provider=self.name,
+                        status_code=400,
+                    ) from e
+                elif "content filter" in msg or "safety" in msg or "blocked" in msg:
+                    raise kernel_errors.ContentFilterError(
+                        str(e),
+                        provider=self.name,
+                        status_code=400,
+                    ) from e
+                else:
+                    raise kernel_errors.InvalidRequestError(
+                        str(e),
+                        provider=self.name,
+                        status_code=400,
+                    ) from e
+            except openai.APIStatusError as e:
+                status = getattr(e, "status_code", 500)
+                if status == 403:
+                    raise kernel_errors.AccessDeniedError(
+                        str(e),
+                        provider=self.name,
+                        status_code=403,
+                    ) from e
+                if status == 404:
+                    raise kernel_errors.NotFoundError(
+                        str(e),
+                        provider=self.name,
+                        status_code=404,
+                    ) from e
+                if status >= 500:
+                    raise kernel_errors.ProviderUnavailableError(
+                        str(e),
+                        provider=self.name,
+                        status_code=status,
+                        retryable=True,
+                    ) from e
+                raise kernel_errors.LLMError(
+                    str(e),
+                    provider=self.name,
+                    status_code=status,
+                    retryable=False,
+                ) from e
+            except asyncio.TimeoutError as e:
+                raise kernel_errors.LLMTimeoutError(
+                    f"Request timed out after {self.timeout}s",
+                    provider=self.name,
+                    retryable=True,
+                ) from e
+            except kernel_errors.LLMError:
+                raise  # Already translated, don't double-wrap
+            except Exception as e:
+                raise kernel_errors.LLMError(
+                    str(e) or f"{type(e).__name__}: (no message)",
+                    provider=self.name,
+                    retryable=True,
+                ) from e
+
+        async def _on_retry(attempt: int, delay: float, error: kernel_errors.LLMError):
+            """Callback invoked before each retry sleep."""
+            if self.coordinator and hasattr(self.coordinator, "hooks"):
+                await self.coordinator.hooks.emit(
+                    PROVIDER_RETRY,
+                    {
+                        "provider": self.name,
+                        "attempt": attempt,
+                        "max_retries": self._retry_config.max_retries,
+                        "delay": delay,
+                        "error_type": type(error).__name__,
+                        "error_message": str(error),
+                    },
+                )
+
         try:
-            for attempt in range(1, self._max_retries + 2):
-                try:
-                    # Phase 2 inner try: translate native SDK errors to kernel types
-                    try:
-                        response = await asyncio.wait_for(
-                            self.client.responses.create(**params), timeout=self.timeout
-                        )
-                    except openai.RateLimitError as e:
-                        retry_after = None
-                        if hasattr(e, "response") and e.response is not None:
-                            ra_header = e.response.headers.get("retry-after")
-                            if ra_header:
-                                try:
-                                    retry_after = float(ra_header)
-                                except (ValueError, TypeError):
-                                    pass
-                        raise kernel_errors.RateLimitError(
-                            str(e),
-                            provider=self.name,
-                            status_code=429,
-                            retryable=True,
-                            retry_after=retry_after,
-                        ) from e
-                    except openai.AuthenticationError as e:
-                        raise kernel_errors.AuthenticationError(
-                            str(e),
-                            provider=self.name,
-                            status_code=getattr(e, "status_code", 401),
-                        ) from e
-                    except openai.BadRequestError as e:
-                        msg = str(e).lower()
-                        if (
-                            "context length" in msg
-                            or "too many tokens" in msg
-                            or "maximum context" in msg
-                        ):
-                            raise kernel_errors.ContextLengthError(
-                                str(e),
-                                provider=self.name,
-                                status_code=400,
-                            ) from e
-                        elif (
-                            "content filter" in msg
-                            or "safety" in msg
-                            or "blocked" in msg
-                        ):
-                            raise kernel_errors.ContentFilterError(
-                                str(e),
-                                provider=self.name,
-                                status_code=400,
-                            ) from e
-                        else:
-                            raise kernel_errors.InvalidRequestError(
-                                str(e),
-                                provider=self.name,
-                                status_code=400,
-                            ) from e
-                    except openai.APIStatusError as e:
-                        status = getattr(e, "status_code", 500)
-                        if status >= 500:
-                            raise kernel_errors.ProviderUnavailableError(
-                                str(e),
-                                provider=self.name,
-                                status_code=status,
-                                retryable=True,
-                            ) from e
-                        raise kernel_errors.LLMError(
-                            str(e),
-                            provider=self.name,
-                            status_code=status,
-                            retryable=False,
-                        ) from e
-                    except asyncio.TimeoutError as e:
-                        raise kernel_errors.LLMTimeoutError(
-                            f"Request timed out after {self.timeout}s",
-                            provider=self.name,
-                            retryable=True,
-                        ) from e
-                    except kernel_errors.LLMError:
-                        raise  # Already translated, don't double-wrap
-                    except Exception as e:
-                        raise kernel_errors.LLMError(
-                            str(e) or f"{type(e).__name__}: (no message)",
-                            provider=self.name,
-                            retryable=True,
-                        ) from e
-
-                    break  # Success — exit retry loop
-
-                except kernel_errors.LLMError as e:
-                    if not e.retryable or attempt > self._max_retries:
-                        raise
-                    retry_after = getattr(e, "retry_after", None)
-                    if retry_after is not None and retry_after > self._max_retry_delay:
-                        raise  # Don't silently wait minutes — fail fast
-                    delay = self._calculate_retry_delay(retry_after, attempt)
-                    # Emit provider:retry event for observability
-                    if self.coordinator and hasattr(self.coordinator, "hooks"):
-                        await self.coordinator.hooks.emit(
-                            "provider:retry",
-                            {
-                                "provider": self.name,
-                                "attempt": attempt,
-                                "delay": delay,
-                                "error_type": type(e).__name__,
-                            },
-                        )
-                    await asyncio.sleep(delay)
+            response = await retry_with_backoff(
+                _do_complete,
+                self._retry_config,
+                on_retry=_on_retry,
+            )
 
             elapsed_ms = int((time.time() - start_time) * 1000)
 
