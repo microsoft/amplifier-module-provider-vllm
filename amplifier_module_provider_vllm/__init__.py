@@ -156,6 +156,21 @@ class VLLMProvider:
         # are injected into request.messages but not persisted to message store).
         self._repaired_tool_ids: set[str] = set()
 
+    @staticmethod
+    def _resolve_config_value(value: str | None, env_var: str, default: str) -> str:
+        """Resolve a config value that may be a ${VAR} placeholder.
+
+        Settings.yaml stores secrets as '${ENV_VAR}' placeholders.
+        The runtime config loader passes these as literal strings,
+        so we resolve them here.
+        """
+        if value and value.startswith("${") and value.endswith("}"):
+            # Placeholder like "${VLLM_API_KEY}" — resolve from environment
+            return os.environ.get(value[2:-1], default)
+        if value:
+            return value
+        return os.environ.get(env_var, default)
+
     @property
     def client(self) -> AsyncOpenAI:
         """Lazily initialize the vLLM client on first access."""
@@ -164,7 +179,9 @@ class VLLMProvider:
                 raise ValueError("base_url or client must be provided for API calls")
             self._client = AsyncOpenAI(
                 base_url=self.base_url,
-                api_key="EMPTY",  # vLLM doesn't require API key
+                api_key=self._resolve_config_value(
+                    self.config.get("api_key"), "VLLM_API_KEY", "EMPTY"
+                ),
                 max_retries=0,  # Phase 2: Disable SDK retries — we handle retry ourselves
             )
         return self._client
@@ -174,7 +191,7 @@ class VLLMProvider:
         return ProviderInfo(
             id="vllm",
             display_name="vLLM",
-            credential_env_vars=[],  # No API key needed for vLLM
+            credential_env_vars=["VLLM_API_KEY"],
             capabilities=["streaming", "tools", "reasoning", "local"],
             defaults={
                 "model": self.default_model,
@@ -193,6 +210,15 @@ class VLLMProvider:
                     env_var="VLLM_BASE_URL",
                     default="http://localhost:8000/v1",
                     required=True,
+                ),
+                ConfigField(
+                    id="api_key",
+                    display_name="API Key",
+                    prompt="vLLM API key (if authentication is required)",
+                    field_type="secret",
+                    env_var="VLLM_API_KEY",
+                    default="",
+                    required=False,
                 ),
             ],
         )
