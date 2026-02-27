@@ -705,66 +705,78 @@ class VLLMProvider:
                     and retry_after > self._retry_config.max_delay
                 ):
                     retryable = False
+                body = getattr(e, "body", None)
+                msg = json.dumps(body) if body is not None else str(e)
                 raise kernel_errors.RateLimitError(
-                    str(e),
+                    msg,
                     provider=self.name,
                     status_code=429,
                     retryable=retryable,
                     retry_after=retry_after,
                 ) from e
             except openai.AuthenticationError as e:
+                body = getattr(e, "body", None)
+                msg = json.dumps(body) if body is not None else str(e)
                 raise kernel_errors.AuthenticationError(
-                    str(e),
+                    msg,
                     provider=self.name,
                     status_code=getattr(e, "status_code", 401),
                 ) from e
             except openai.BadRequestError as e:
-                msg = str(e).lower()
+                raw_msg = str(e).lower()
+                body = getattr(e, "body", None)
+                error_msg = json.dumps(body) if body is not None else str(e)
                 if (
-                    "context length" in msg
-                    or "too many tokens" in msg
-                    or "maximum context" in msg
+                    "context length" in raw_msg
+                    or "too many tokens" in raw_msg
+                    or "maximum context" in raw_msg
                 ):
                     raise kernel_errors.ContextLengthError(
-                        str(e),
+                        error_msg,
                         provider=self.name,
                         status_code=400,
                     ) from e
-                elif "content filter" in msg or "safety" in msg or "blocked" in msg:
+                elif (
+                    "content filter" in raw_msg
+                    or "safety" in raw_msg
+                    or "blocked" in raw_msg
+                ):
                     raise kernel_errors.ContentFilterError(
-                        str(e),
+                        error_msg,
                         provider=self.name,
                         status_code=400,
                     ) from e
                 else:
                     raise kernel_errors.InvalidRequestError(
-                        str(e),
+                        error_msg,
                         provider=self.name,
                         status_code=400,
                     ) from e
             except openai.APIStatusError as e:
                 status = getattr(e, "status_code", 500)
+                body = getattr(e, "body", None)
+                error_msg = json.dumps(body) if body is not None else str(e)
                 if status == 403:
                     raise kernel_errors.AccessDeniedError(
-                        str(e),
+                        error_msg,
                         provider=self.name,
                         status_code=403,
                     ) from e
                 if status == 404:
                     raise kernel_errors.NotFoundError(
-                        str(e),
+                        error_msg,
                         provider=self.name,
                         status_code=404,
                     ) from e
                 if status >= 500:
                     raise kernel_errors.ProviderUnavailableError(
-                        str(e),
+                        error_msg,
                         provider=self.name,
                         status_code=status,
                         retryable=True,
                     ) from e
                 raise kernel_errors.LLMError(
-                    str(e),
+                    error_msg,
                     provider=self.name,
                     status_code=status,
                     retryable=False,
@@ -778,8 +790,14 @@ class VLLMProvider:
             except kernel_errors.LLMError:
                 raise  # Already translated, don't double-wrap
             except Exception as e:
+                body = getattr(e, "body", None)
+                error_msg = (
+                    json.dumps(body)
+                    if body is not None
+                    else (str(e) or f"{type(e).__name__}: (no message)")
+                )
                 raise kernel_errors.LLMError(
-                    str(e) or f"{type(e).__name__}: (no message)",
+                    error_msg,
                     provider=self.name,
                     retryable=True,
                 ) from e
