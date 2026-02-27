@@ -133,6 +133,10 @@ def convert_response_with_accumulated_output(
                 # Ensure tool_input is dict after json.loads or default
                 if not isinstance(tool_input, dict):
                     tool_input = {}
+                # Repair stringified nested JSON (common with Qwen3-Coder-Next)
+                from . import _deep_unstringify
+
+                tool_input = _deep_unstringify(tool_input)
                 content_blocks.append(
                     ToolCallBlock(id=tool_id, name=tool_name, input=tool_input)
                 )

@@ -49,6 +49,33 @@ from ._token_accounting import should_apply_token_accounting
 logger = logging.getLogger(__name__)
 
 
+def _deep_unstringify(obj: Any) -> Any:
+    """Recursively parse stringified JSON values in tool call arguments.
+
+    Some models (e.g., Qwen3-Coder-Next) emit nested JSON arrays/objects as
+    strings within tool call arguments, like:
+        {"action": "create", "todos": "[{\\"content\\": \\"...\\"}, ...]"}
+    instead of:
+        {"action": "create", "todos": [{"content": "..."}, ...]}
+
+    This walks the parsed dict and tries to json.loads any string values
+    that look like JSON (start with '[' or '{').
+    """
+    if isinstance(obj, dict):
+        return {k: _deep_unstringify(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_deep_unstringify(item) for item in obj]
+    if isinstance(obj, str):
+        stripped = obj.strip()
+        if stripped and stripped[0] in ("[", "{"):
+            try:
+                parsed = json.loads(stripped)
+                return _deep_unstringify(parsed)
+            except (json.JSONDecodeError, RecursionError):
+                pass
+    return obj
+
+
 class VLLMChatResponse(ChatResponse):
     """ChatResponse with additional fields for streaming UI compatibility."""
 
@@ -65,7 +92,12 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
         "VLLM_BASE_URL", "http://localhost:8000/v1"
     )
 
-    provider = VLLMProvider(base_url=base_url, config=config, coordinator=coordinator)
+    # API key from config or environment (for auth proxies)
+    api_key = config.get("api_key") or os.environ.get("VLLM_API_KEY", "EMPTY")
+
+    provider = VLLMProvider(
+        base_url=base_url, api_key=api_key, config=config, coordinator=coordinator
+    )
     await coordinator.mount("providers", provider, name="vllm")
     logger.info(f"Mounted VLLMProvider (Responses API) at {base_url}")
 
@@ -87,6 +119,7 @@ class VLLMProvider:
         self,
         base_url: str | None = None,
         *,
+        api_key: str = "EMPTY",
         config: dict[str, Any] | None = None,
         coordinator: ModuleCoordinator | None = None,
         client: AsyncOpenAI | None = None,
@@ -98,6 +131,7 @@ class VLLMProvider:
 
         Args:
             base_url: vLLM server URL (e.g., http://192.168.128.5:8000/v1)
+            api_key: API key for auth proxies (default "EMPTY" for local)
             config: Provider configuration
             coordinator: Module coordinator
             client: Pre-configured AsyncOpenAI client (for testing)
@@ -106,6 +140,7 @@ class VLLMProvider:
         self.config = config or {}
         self.coordinator = coordinator
         self.base_url = base_url
+        self.api_key = api_key
 
         # Configuration with sensible defaults (from _constants.py - single source of truth)
         self.default_model = self.config.get("default_model", DEFAULT_MODEL)
@@ -164,7 +199,7 @@ class VLLMProvider:
                 raise ValueError("base_url or client must be provided for API calls")
             self._client = AsyncOpenAI(
                 base_url=self.base_url,
-                api_key="EMPTY",  # vLLM doesn't require API key
+                api_key=self.api_key,  # From config, env, or "EMPTY" for local
                 max_retries=0,  # Phase 2: Disable SDK retries — we handle retry ourselves
             )
         return self._client
@@ -193,6 +228,15 @@ class VLLMProvider:
                     env_var="VLLM_BASE_URL",
                     default="http://localhost:8000/v1",
                     required=True,
+                ),
+                ConfigField(
+                    id="api_key",
+                    display_name="API Key",
+                    prompt="API key (for auth proxies, leave empty for local)",
+                    field_type="secret",
+                    env_var="VLLM_API_KEY",
+                    default="EMPTY",
+                    required=False,
                 ),
             ],
         )
@@ -1475,6 +1519,8 @@ class VLLMProvider:
                     # Ensure tool_input is dict after json.loads or default
                     if not isinstance(tool_input, dict):
                         tool_input = {}
+                    # Repair stringified nested JSON (common with Qwen3-Coder-Next)
+                    tool_input = _deep_unstringify(tool_input)
                     content_blocks.append(
                         ToolCallBlock(id=tool_id, name=tool_name, input=tool_input)
                     )
