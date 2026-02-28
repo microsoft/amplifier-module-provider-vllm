@@ -262,6 +262,9 @@ class VLLMProvider:
                     max_output_tokens=32768,  # Default
                     capabilities=["tools", "streaming", "reasoning", "local"],
                     defaults={"temperature": None, "max_tokens": 16384},
+                    cost_per_input_token=0.0,
+                    cost_per_output_token=0.0,
+                    metadata={"cost_tier": "free"},
                 )
             )
         return models
