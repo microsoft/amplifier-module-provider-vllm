@@ -199,6 +199,44 @@ class VLLMProvider:
             )
         return self._client
 
+    @staticmethod
+    def _is_cloudflare_challenge(error) -> bool:
+        """Detect Cloudflare bot-management challenge responses.
+
+        Cloudflare interposes HTML challenge pages (HTTP 403) that look nothing
+        like real API errors.  Signals:
+
+        1. The SDK failed to parse the body as JSON (error.body is None).
+        2. The Content-Type is text/html (not application/json).
+        3. The raw response text contains Cloudflare markers.
+
+        Any combination of (1 + 2) or (1 + 3) is sufficient.  If the SDK
+        successfully parsed a JSON body, this is a real API error regardless
+        of other signals.
+        """
+        # If the SDK parsed a JSON body, this is a real API error
+        if getattr(error, "body", None) is not None:
+            return False
+
+        # Inspect the raw HTTP response for HTML / Cloudflare signals
+        response = getattr(error, "response", None)
+        if response is None:
+            return False
+
+        content_type = getattr(response, "headers", {}).get("content-type", "")
+        if "text/html" in content_type:
+            return True
+
+        # Fallback: scan response text for Cloudflare markers
+        text = getattr(response, "text", "") or ""
+        cf_markers = (
+            "Just a moment",
+            "cf-browser-verification",
+            "cloudflare",
+            "Checking if the site connection is secure",
+        )
+        return any(marker in text for marker in cf_markers)
+
     def get_info(self) -> ProviderInfo:
         """Get provider metadata."""
         return ProviderInfo(
@@ -796,6 +834,18 @@ class VLLMProvider:
                 body = getattr(e, "body", None)
                 error_msg = json.dumps(body) if body is not None else str(e)
                 if status == 403:
+                    if self._is_cloudflare_challenge(e):
+                        logger.warning(
+                            "[PROVIDER] Cloudflare challenge detected (HTTP 403 "
+                            "with HTML body). Treating as transient — will retry."
+                        )
+                        raise kernel_errors.ProviderUnavailableError(
+                            "Cloudflare bot challenge (transient 403 with HTML body). "
+                            "This typically resolves on retry.",
+                            provider=self.name,
+                            status_code=403,
+                            retryable=True,
+                        ) from e
                     raise kernel_errors.AccessDeniedError(
                         error_msg,
                         provider=self.name,

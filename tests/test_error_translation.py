@@ -246,3 +246,43 @@ def test_llm_response_error_event_emitted_on_kernel_error():
     ]
     assert len(error_events) >= 1
     assert error_events[0][1]["provider"] == "vllm"
+
+
+def test_cloudflare_403_raises_provider_unavailable():
+    """403 with body=None + text/html (Cloudflare challenge) -> ProviderUnavailableError (retryable)."""
+    provider = _make_provider()
+    native = openai.APIStatusError(
+        "Forbidden",
+        response=_mock_httpx_response(403, headers={"content-type": "text/html"}),
+        body=None,
+    )
+    provider.client.responses.create = AsyncMock(side_effect=native)
+
+    with pytest.raises(kernel_errors.ProviderUnavailableError) as exc_info:
+        asyncio.run(provider.complete(_simple_request()))
+
+    err = exc_info.value
+    assert err.provider == "vllm"
+    assert err.status_code == 403
+    assert err.retryable is True
+    assert err.__cause__ is native
+
+
+def test_real_api_403_raises_access_denied():
+    """403 with body=dict (real API error) -> AccessDeniedError (not retryable)."""
+    provider = _make_provider()
+    native = openai.APIStatusError(
+        "Forbidden",
+        response=_mock_httpx_response(403),
+        body={"error": {"type": "permissions_error", "message": "Access denied"}},
+    )
+    provider.client.responses.create = AsyncMock(side_effect=native)
+
+    with pytest.raises(kernel_errors.AccessDeniedError) as exc_info:
+        asyncio.run(provider.complete(_simple_request()))
+
+    err = exc_info.value
+    assert err.provider == "vllm"
+    assert err.status_code == 403
+    assert err.retryable is False
+    assert err.__cause__ is native
