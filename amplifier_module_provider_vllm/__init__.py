@@ -204,7 +204,7 @@ class VLLMProvider:
         return ProviderInfo(
             id="vllm",
             display_name="vLLM",
-            credential_env_vars=[],  # No API key needed for vLLM
+            credential_env_vars=["VLLM_API_KEY"],
             capabilities=["streaming", "tools", "reasoning", "local"],
             defaults={
                 "model": self.default_model,
