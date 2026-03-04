@@ -248,6 +248,71 @@ def test_llm_response_error_event_emitted_on_kernel_error():
     assert error_events[0][1]["provider"] == "vllm"
 
 
+# ---------------------------------------------------------------------------
+# Unit tests for _is_cloudflare_challenge static method
+# ---------------------------------------------------------------------------
+
+
+class TestIsCloudflareChallenge:
+    """Direct unit tests for the _is_cloudflare_challenge static method."""
+
+    def _check(self, error: openai.APIStatusError) -> bool:
+        """Call _is_cloudflare_challenge via an instance (pyright can't resolve the static method on the class)."""
+        provider = _make_provider()
+        return provider._is_cloudflare_challenge(error)  # type: ignore[attr-defined]
+
+    def test_returns_false_when_body_is_present(self):
+        """Real API error with parsed JSON body -> not a Cloudflare challenge."""
+        error = openai.APIStatusError(
+            "Forbidden",
+            response=_mock_httpx_response(403, headers={"content-type": "text/html"}),
+            body={"error": {"type": "permissions_error", "message": "Denied"}},
+        )
+        assert self._check(error) is False
+
+    def test_returns_false_when_response_is_none(self):
+        """No response object at all -> not a Cloudflare challenge."""
+        error = openai.APIStatusError(
+            "Forbidden",
+            response=_mock_httpx_response(403),
+            body=None,
+        )
+        # Simulate missing response attribute
+        error.response = None  # type: ignore[assignment]
+        assert self._check(error) is False
+
+    def test_returns_true_for_text_html_content_type(self):
+        """body=None + text/html Content-Type -> Cloudflare challenge."""
+        error = openai.APIStatusError(
+            "Forbidden",
+            response=_mock_httpx_response(403, headers={"content-type": "text/html"}),
+            body=None,
+        )
+        assert self._check(error) is True
+
+    def test_returns_true_for_text_html_with_charset(self):
+        """body=None + text/html;charset=UTF-8 -> Cloudflare challenge."""
+        error = openai.APIStatusError(
+            "Forbidden",
+            response=_mock_httpx_response(
+                403, headers={"content-type": "text/html; charset=UTF-8"}
+            ),
+            body=None,
+        )
+        assert self._check(error) is True
+
+    def test_returns_false_for_json_content_type_no_body(self):
+        """body=None + application/json (SDK parse failure) -> not Cloudflare."""
+        error = openai.APIStatusError(
+            "Forbidden",
+            response=_mock_httpx_response(
+                403, headers={"content-type": "application/json"}
+            ),
+            body=None,
+        )
+        assert self._check(error) is False
+
+
 def test_cloudflare_403_raises_provider_unavailable():
     """403 with body=None + text/html (Cloudflare challenge) -> ProviderUnavailableError (retryable)."""
     provider = _make_provider()
