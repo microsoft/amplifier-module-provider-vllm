@@ -17,6 +17,8 @@ def _make_provider() -> VLLMProvider:
     provider = VLLMProvider(base_url="http://localhost:8000/v1")
     fake_coordinator = MagicMock()
     fake_coordinator.hooks = MagicMock()
+    # cast() satisfies pyright — ModuleCoordinator is only needed for type checking,
+    # not at runtime (MagicMock handles all attribute access dynamically).
     provider.coordinator = cast(ModuleCoordinator, fake_coordinator)
     return provider
 
@@ -93,3 +95,14 @@ class TestContinuationInputFormat:
         assert assistant_msg["content"] == [
             {"type": "output_text", "text": "Once upon a time..."}
         ]
+
+    def test_empty_assistant_content_not_appended(self) -> None:
+        """When accumulated output has no extractable text, no assistant message is added."""
+        provider = _make_provider()
+        original_input = [{"role": "user", "content": "Start a story"}]
+        # Output item has no content entries — nothing to extract
+        accumulated_output: list[dict[str, Any]] = [{"type": "message", "content": []}]
+        result = provider._build_continuation_input(original_input, accumulated_output)
+        # Only the original user message — no assistant message appended
+        assert len(result) == 1
+        assert result[0] == {"role": "user", "content": "Start a story"}
