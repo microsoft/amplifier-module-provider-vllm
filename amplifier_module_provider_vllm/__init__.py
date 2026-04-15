@@ -1357,9 +1357,7 @@ class VLLMProvider:
                         {
                             "role": "assistant",
                             "type": "message",
-                            "content": [
-                                {"type": "output_text", "text": combined_text}
-                            ],
+                            "content": [{"type": "output_text", "text": combined_text}],
                         }
                     )
 
