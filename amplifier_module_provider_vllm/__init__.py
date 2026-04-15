@@ -367,7 +367,7 @@ class VLLMProvider:
         # If we extracted any assistant content, add as assistant message
         if assistant_content:
             continuation_input.append(
-                {"role": "assistant", "content": assistant_content}
+                {"role": "assistant", "type": "message", "content": assistant_content}
             )
 
         return continuation_input
@@ -1354,7 +1354,13 @@ class VLLMProvider:
                 if text_parts:
                     combined_text = "\n".join(text_parts)
                     openai_messages.append(
-                        {"role": "assistant", "content": combined_text}
+                        {
+                            "role": "assistant",
+                            "type": "message",
+                            "content": [
+                                {"type": "output_text", "text": combined_text}
+                            ],
+                        }
                     )
 
                 i += 1
