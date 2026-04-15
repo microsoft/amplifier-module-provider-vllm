@@ -47,7 +47,10 @@ class TestAssistantMessageFormat:
         provider = _make_provider()
         messages: list[dict[str, Any]] = [
             {"role": "user", "content": "Tell me something"},
-            {"role": "assistant", "content": [{"type": "text", "text": "Here is something."}]},
+            {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "Here is something."}],
+            },
             {"role": "user", "content": "Tell me more"},
         ]
         result = provider._convert_messages(messages)
@@ -77,11 +80,16 @@ class TestContinuationInputFormat:
         provider = _make_provider()
         original_input = [{"role": "user", "content": "Start a story"}]
         accumulated_output = [
-            {"type": "message", "content": [{"type": "output_text", "text": "Once upon a time..."}]}
+            {
+                "type": "message",
+                "content": [{"type": "output_text", "text": "Once upon a time..."}],
+            }
         ]
         result = provider._build_continuation_input(original_input, accumulated_output)
         assert len(result) == 2
         assistant_msg = result[1]
         assert assistant_msg["role"] == "assistant"
         assert assistant_msg.get("type") == "message"
-        assert assistant_msg["content"] == [{"type": "output_text", "text": "Once upon a time..."}]
+        assert assistant_msg["content"] == [
+            {"type": "output_text", "text": "Once upon a time..."}
+        ]
