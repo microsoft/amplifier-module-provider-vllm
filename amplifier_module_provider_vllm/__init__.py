@@ -291,7 +291,8 @@ class VLLMProvider:
                 ModelInfo(
                     id=model.id,
                     display_name=model.id,
-                    context_window=128000,  # Default, vLLM doesn't expose this
+                    context_window=getattr(model, "max_model_len", None)
+                    or 128000,  # vLLM >=0.6 exposes max_model_len; None/absent → 128000
                     max_output_tokens=32768,  # Default
                     capabilities=["tools", "streaming", "reasoning", "local"],
                     defaults={"temperature": None, "max_tokens": 16384},
