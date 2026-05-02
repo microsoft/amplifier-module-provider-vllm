@@ -1027,25 +1027,29 @@ class VLLMProvider:
             # Use the final response and accumulated output for conversion
             response = final_response
 
-            # Extract usage counts
-            usage_obj = response.usage if hasattr(response, "usage") else None
-            usage_counts = {"input": 0, "output": 0, "total": 0}
-            if usage_obj:
-                if hasattr(usage_obj, "input_tokens"):
-                    usage_counts["input"] = usage_obj.input_tokens
-                if hasattr(usage_obj, "output_tokens"):
-                    usage_counts["output"] = usage_obj.output_tokens
-                usage_counts["total"] = usage_counts["input"] + usage_counts["output"]
+            # Convert to ChatResponse FIRST (before emitting llm:response)
+            # so event usage fields come from the canonical ChatResponse
+            if continuation_count > 0:
+                # Use new helper for accumulated output
+                chat_response = convert_response_with_accumulated_output(
+                    response, accumulated_output, continuation_count, VLLMChatResponse
+                )
+            else:
+                # Use existing conversion for normal (non-continued) responses
+                chat_response = self._convert_to_chat_response(response)
 
-            # Emit llm:response event
+            # Emit llm:response event using canonical usage fields from chat_response
             if self.coordinator and hasattr(self.coordinator, "hooks"):
+                event_usage: dict[str, Any] = {}
+                if chat_response.usage:
+                    event_usage["input_tokens"] = chat_response.usage.input_tokens
+                    event_usage["output_tokens"] = chat_response.usage.output_tokens
+                    if chat_response.usage.cache_read_tokens is not None:
+                        event_usage["cache_read_tokens"] = chat_response.usage.cache_read_tokens
                 response_event: dict[str, Any] = {
                     "provider": self.name,
                     "model": params["model"],
-                    "usage": {
-                        "input": usage_counts["input"],
-                        "output": usage_counts["output"],
-                    },
+                    "usage": event_usage,
                     "status": "ok",
                     "duration_ms": elapsed_ms,
                     "continuation_count": continuation_count
@@ -1056,15 +1060,7 @@ class VLLMProvider:
                     response_event["raw"] = redact_secrets(response.model_dump())
                 await self.coordinator.hooks.emit("llm:response", response_event)
 
-            # Convert to ChatResponse with accumulated output
-            # If there were continuations, use the accumulated output; otherwise use response.output directly
-            if continuation_count > 0:
-                # Use new helper for accumulated output
-                return convert_response_with_accumulated_output(
-                    response, accumulated_output, continuation_count, VLLMChatResponse
-                )
-            # Use existing conversion for normal (non-continued) responses
-            return self._convert_to_chat_response(response)
+            return chat_response
 
         except kernel_errors.LLMError as e:
             elapsed_ms = int((time.time() - start_time) * 1000)
