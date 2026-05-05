@@ -10,7 +10,7 @@ This provider module integrates vLLM's OpenAI-compatible Responses API with Ampl
 - **Responses API only** - Optimized for reasoning models (gpt-oss, etc.)
 - **Full reasoning support** - Automatic reasoning block separation
 - **Tool calling** - Complete tool integration via Responses API
-- **No API key required** - Works with local vLLM servers
+- **Local OR remote** - Works against a local vLLM with no auth, or any remote / hosted endpoint with Bearer auth
 - **OpenAI-compatible** - Uses OpenAI SDK under the hood
 
 ## Installation
@@ -89,6 +89,73 @@ providers:
       raw_debug: false                      # Enable raw API I/O logging
       debug_truncate_length: 180            # Truncate long debug strings
 ```
+
+### Local vs remote — single source of truth
+
+`base_url` is the **single source of truth** for whether this provider
+instance is local or remote. The provider URL-parses it once at
+construction and caches the result; everything downstream
+(`is_remote` property, capability tagging in `get_info()` and
+`list_models()`) flows from that one decision.
+
+- **Local** — `base_url` resolves to `localhost`, `127.0.0.1`, `::1`, or
+  `0.0.0.0`. Capability tag: `local`. No auth required (api_key is
+  ignored if it is the placeholder `"EMPTY"`).
+- **Remote** — anything else (LAN IP, public hostname, RunPod / Modal /
+  Anyscale / Lambda Labs URL, or a vLLM-backed proxy like
+  OpenRouter/Together/Fireworks). Capability tag: `remote`. Bearer auth
+  is attached when `api_key` is set.
+
+The `is_remote` property is purely informational — it does not change
+how Bearer is attached (the OpenAI SDK does that whenever `api_key` is
+non-empty regardless of host). It exists so routing matrices and other
+downstream consumers can reason about the deployment shape.
+
+## Mixed local + remote (multi-instance)
+
+To use **both** a local vLLM and a remote / hosted vLLM in the same
+session, configure two provider instances. Amplifier supports multiple
+named instances of the same provider module via the `instance_id` key:
+
+```toml
+# Default LOCAL instance — keeps the natural mount name "vllm"
+[[providers]]
+module = "amplifier-module-provider-vllm"
+[providers.config]
+base_url = "http://localhost:8000/v1"
+default_model = "openai/gpt-oss-20b"
+
+# Second instance — explicit `instance_id` makes it addressable as "vllm-remote"
+[[providers]]
+module = "amplifier-module-provider-vllm"
+instance_id = "vllm-remote"
+[providers.config]
+base_url = "https://api.endpoints.anyscale.com/v1"  # or your hosted vLLM URL
+api_key = "${VLLM_API_KEY}"
+default_model = "meta-llama/Llama-3.3-70B-Instruct"
+```
+
+A routing matrix can then target each independently:
+
+```yaml
+roles:
+  reasoning:
+    candidates:
+      - provider: vllm-remote
+        model: "meta-llama/Llama-3.3-70B-Instruct"
+      - provider: vllm
+        model: "openai/gpt-oss-20b"
+  fast:
+    candidates:
+      - provider: vllm
+        model: "openai/gpt-oss-20b"
+```
+
+The kernel validates that at most one entry per module omits
+`instance_id` (the "default" keeps the natural mount name); any
+additional entries must specify an `instance_id`. See
+[`amplifier-core/_session_init.py`](https://github.com/microsoft/amplifier-core)
+for the exact contract.
 
 ## Usage Examples
 

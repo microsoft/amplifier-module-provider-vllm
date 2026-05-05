@@ -16,6 +16,7 @@ import time
 import uuid
 from collections import defaultdict
 from typing import Any
+from urllib.parse import urlparse
 
 import openai
 from amplifier_core import ConfigField
@@ -48,6 +49,36 @@ from ._token_accounting import apply_token_accounting
 from ._token_accounting import should_apply_token_accounting
 
 logger = logging.getLogger(__name__)
+
+
+def _is_remote_host(base_url: str | None) -> bool:
+    """True when base_url points at a non-localhost vLLM endpoint.
+
+    A "remote" vLLM is anything that is NOT loopback (localhost / 127.0.0.1
+    / ::1 / etc.). Used as the single source of truth for capability
+    tagging — local vs remote affects how routing matrices and downstream
+    consumers reason about the deployment shape.
+
+    Unlike Ollama Cloud (a single canonical hostname), vLLM has no
+    first-party SaaS — "remote" simply means the inference engine isn't
+    running on this machine. Could be a self-hosted box on the LAN, a
+    cloud VM (RunPod / Modal / Anyscale / Lambda Labs), or a vLLM-backed
+    API proxy. From the provider's perspective they're all the same:
+    a non-loopback URL where Bearer auth might apply if api_key is set.
+    """
+    if not base_url:
+        return False
+    try:
+        parsed = urlparse(base_url)
+    except ValueError:
+        return False
+    # Use .hostname (not .netloc) — it handles IPv6 brackets and userinfo
+    # correctly. e.g. urlparse("http://[::1]:8000/v1").hostname == "::1".
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return False
+    loopback = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
+    return host not in loopback
 
 
 def _deep_unstringify(obj: Any) -> Any:
@@ -141,6 +172,11 @@ class VLLMProvider:
         self.coordinator = coordinator
         self.base_url = base_url
         self.api_key = api_key
+
+        # Cache is_remote at construction so we don't re-parse the URL on
+        # every property access (used in capabilities tagging, default
+        # behavior decisions). The URL is the SSOT for local-vs-remote.
+        self._is_remote_cached: bool = _is_remote_host(base_url)
 
         # Fail fast: require either base_url or a pre-built client.
         # Without this guard, instantiation silently succeeds with base_url=None and
@@ -237,13 +273,27 @@ class VLLMProvider:
         )
         return any(marker in text for marker in cf_markers)
 
+    @property
+    def is_remote(self) -> bool:
+        """True when configured against a non-localhost vLLM endpoint.
+
+        Returns the value cached in ``__init__`` — see :func:`_is_remote_host`
+        for the URL-parse logic.
+        """
+        return self._is_remote_cached
+
     def get_info(self) -> ProviderInfo:
         """Get provider metadata."""
         return ProviderInfo(
             id="vllm",
             display_name="vLLM",
             credential_env_vars=["VLLM_API_KEY"],
-            capabilities=["streaming", "tools", "reasoning", "local"],
+            capabilities=[
+                "streaming",
+                "tools",
+                "reasoning",
+                "remote" if self._is_remote_cached else "local",
+            ],
             defaults={
                 "model": self.default_model,
                 "max_tokens": 16384,
@@ -253,19 +303,29 @@ class VLLMProvider:
                 "max_output_tokens": 128000,
             },
             config_fields=[
+                # base_url is the single source of truth for local-vs-remote.
+                # Localhost URLs are treated as local; any other URL is treated
+                # as remote (capability-tagged accordingly). To run BOTH a local
+                # and a remote vLLM instance simultaneously, configure two
+                # provider instances with different ``instance_id`` values
+                # (see README "Mixed local + remote (multi-instance)").
                 ConfigField(
                     id="base_url",
                     display_name="Server URL",
-                    prompt="vLLM server URL",
+                    prompt="vLLM server URL (localhost for local; any remote URL for hosted)",
                     field_type="text",
                     env_var="VLLM_BASE_URL",
                     default="http://localhost:8000/v1",
                     required=True,
                 ),
+                # api_key is OPTIONAL — required only when the upstream vLLM
+                # endpoint enforces Bearer auth (most hosted providers and any
+                # custom auth-proxy deployment). For an unauthenticated local
+                # vLLM, leave it empty (the OpenAI client tolerates "EMPTY").
                 ConfigField(
                     id="api_key",
                     display_name="API Key",
-                    prompt="API key (for auth proxies, leave empty for local)",
+                    prompt="API key (required for auth-protected endpoints; leave empty for local)",
                     field_type="secret",
                     env_var="VLLM_API_KEY",
                     default="EMPTY",
@@ -293,7 +353,12 @@ class VLLMProvider:
                     display_name=model.id,
                     context_window=128000,  # Default, vLLM doesn't expose this
                     max_output_tokens=32768,  # Default
-                    capabilities=["tools", "streaming", "reasoning", "local"],
+                    capabilities=[
+                        "tools",
+                        "streaming",
+                        "reasoning",
+                        "remote" if self._is_remote_cached else "local",
+                    ],
                     defaults={"temperature": None, "max_tokens": 16384},
                 )
             )
