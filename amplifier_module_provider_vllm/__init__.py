@@ -15,6 +15,7 @@ import os
 import time
 import uuid
 from collections import defaultdict
+from decimal import Decimal
 from typing import Any
 from urllib.parse import urlparse
 
@@ -44,6 +45,7 @@ from ._constants import MAX_CONTINUATION_ATTEMPTS
 from ._constants import METADATA_INCOMPLETE_REASON
 from ._constants import METADATA_RESPONSE_ID
 from ._constants import METADATA_STATUS
+from ._cost import compute_cost
 from ._response_handling import convert_response_with_accumulated_output
 from ._token_accounting import apply_token_accounting
 from ._token_accounting import should_apply_token_accounting
@@ -118,6 +120,29 @@ class VLLMChatResponse(ChatResponse):
 async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = None):
     """Mount the vLLM provider."""
     config = config or {}
+
+    # ---------------------------------------------------------------------------
+    # Cost accumulation hook and session.cost contributor
+    # vLLM is self-hosted — cost is always indeterminate (None), never $0.00.
+    # The _accumulate hook's `if raw is not None` branch is never taken,
+    # so the contributor always returns None (correct semantics).
+    # ---------------------------------------------------------------------------
+    _totals: dict = {"cost_usd": None, "has_data": False}
+
+    async def _accumulate(event: str, data: dict) -> None:
+        raw = (data.get("usage") or {}).get("cost_usd")
+        if raw is not None:
+            _totals["cost_usd"] = (_totals["cost_usd"] or Decimal("0")) + Decimal(
+                str(raw)
+            )
+            _totals["has_data"] = True
+
+    coordinator.hooks.register("llm:response", _accumulate)
+    coordinator.register_contributor(
+        "session.cost",
+        "provider-vllm",
+        lambda: {"cost_usd": _totals["cost_usd"]} if _totals["has_data"] else None,
+    )
 
     # vLLM server URL from config or environment
     base_url = config.get("base_url") or os.environ.get(
@@ -1110,7 +1135,13 @@ class VLLMProvider:
                     event_usage["input_tokens"] = chat_response.usage.input_tokens
                     event_usage["output_tokens"] = chat_response.usage.output_tokens
                     if chat_response.usage.cache_read_tokens is not None:
-                        event_usage["cache_read_tokens"] = chat_response.usage.cache_read_tokens
+                        event_usage["cache_read_tokens"] = (
+                            chat_response.usage.cache_read_tokens
+                        )
+                    _cost_usd = getattr(chat_response.usage, "cost_usd", None)
+                    event_usage["cost_usd"] = (
+                        str(_cost_usd) if _cost_usd is not None else None
+                    )
                 response_event: dict[str, Any] = {
                     "provider": self.name,
                     "model": params["model"],
@@ -1691,6 +1722,15 @@ class VLLMProvider:
             reasoning_tokens=reasoning_tokens,
             cache_read_tokens=cache_read_tokens,
         )
+
+        # Stamp cost_usd — vLLM is self-hosted so cost is always indeterminate (None).
+        model_id = getattr(response, "model", "")
+        cost = compute_cost(
+            model_id,
+            input_tokens=usage_counts["input"],
+            output_tokens=usage_counts["output"],
+        )
+        usage = usage.model_copy(update={"cost_usd": cost})
 
         combined_text = "\n\n".join(text_accumulator).strip()
 
