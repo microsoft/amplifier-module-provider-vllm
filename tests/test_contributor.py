@@ -90,8 +90,8 @@ async def test_contributor_always_returns_none_after_events(mock_coordinator):
     ]
 
     # vLLM always emits cost_usd=None
-    await accumulate("llm:response", {"usage": {"cost_usd": None}})
-    await accumulate("llm:response", {"usage": {"cost_usd": None}})
+    await accumulate("llm:response", {"provider": "vllm", "usage": {"cost_usd": None}})
+    await accumulate("llm:response", {"provider": "vllm", "usage": {"cost_usd": None}})
 
     assert callback() is None, (
         "Contributor should always return None for self-hosted vLLM"
