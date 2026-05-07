@@ -130,11 +130,13 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     _totals: dict = {"cost_usd": None, "has_data": False}
 
     async def _accumulate(event: str, data: dict) -> None:
+        if data.get("provider") != "vllm":  # ignore events from other providers
+            return
         raw = (data.get("usage") or {}).get("cost_usd")
         if raw is not None:
-            _totals["cost_usd"] = (_totals["cost_usd"] if _totals["cost_usd"] is not None else Decimal("0")) + Decimal(
-                str(raw)
-            )
+            _totals["cost_usd"] = (
+                _totals["cost_usd"] if _totals["cost_usd"] is not None else Decimal("0")
+            ) + Decimal(str(raw))
             _totals["has_data"] = True
 
     coordinator.hooks.register("llm:response", _accumulate)
@@ -1138,7 +1140,9 @@ class VLLMProvider:
                         event_usage["cache_read_tokens"] = (
                             chat_response.usage.cache_read_tokens
                         )
-                    event_usage["cost_usd"] = getattr(chat_response.usage, "cost_usd", None)
+                    event_usage["cost_usd"] = getattr(
+                        chat_response.usage, "cost_usd", None
+                    )
                 response_event: dict[str, Any] = {
                     "provider": self.name,
                     "model": params["model"],
