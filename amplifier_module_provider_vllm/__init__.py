@@ -127,25 +127,6 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     # The _accumulate hook's `if raw is not None` branch is never taken,
     # so the contributor always returns None (correct semantics).
     # ---------------------------------------------------------------------------
-    _totals: dict = {"cost_usd": None, "has_data": False}
-
-    async def _accumulate(event: str, data: dict) -> None:
-        if data.get("provider") != "vllm":  # ignore events from other providers
-            return
-        raw = (data.get("usage") or {}).get("cost_usd")
-        if raw is not None:
-            _totals["cost_usd"] = (
-                _totals["cost_usd"] if _totals["cost_usd"] is not None else Decimal("0")
-            ) + Decimal(str(raw))
-            _totals["has_data"] = True
-
-    coordinator.hooks.register("llm:response", _accumulate)
-    coordinator.register_contributor(
-        "session.cost",
-        "provider-vllm",
-        lambda: {"cost_usd": _totals["cost_usd"]} if _totals["has_data"] else None,
-    )
-
     # vLLM server URL from config or environment
     base_url = config.get("base_url") or os.environ.get(
         "VLLM_BASE_URL", "http://localhost:8000/v1"
