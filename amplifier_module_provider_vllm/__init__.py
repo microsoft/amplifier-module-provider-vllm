@@ -121,12 +121,6 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     """Mount the vLLM provider."""
     config = config or {}
 
-    # ---------------------------------------------------------------------------
-    # Cost accumulation hook and session.cost contributor
-    # vLLM is self-hosted — cost is always indeterminate (None), never $0.00.
-    # The _accumulate hook's `if raw is not None` branch is never taken,
-    # so the contributor always returns None (correct semantics).
-    # ---------------------------------------------------------------------------
     # vLLM server URL from config or environment
     base_url = config.get("base_url") or os.environ.get(
         "VLLM_BASE_URL", "http://localhost:8000/v1"
