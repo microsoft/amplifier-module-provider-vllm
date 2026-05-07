@@ -132,7 +132,7 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     async def _accumulate(event: str, data: dict) -> None:
         raw = (data.get("usage") or {}).get("cost_usd")
         if raw is not None:
-            _totals["cost_usd"] = (_totals["cost_usd"] or Decimal("0")) + Decimal(
+            _totals["cost_usd"] = (_totals["cost_usd"] if _totals["cost_usd"] is not None else Decimal("0")) + Decimal(
                 str(raw)
             )
             _totals["has_data"] = True
