@@ -56,11 +56,22 @@ class TestMountCleanupBugFix:
     async def test_mount_cleanup_does_not_trigger_lazy_init(self):
         """Calling the mount cleanup should not create a client via the .client property."""
 
+        class FakeHooks:
+            def register(self, event, handler):
+                pass
+
+            async def emit(self, event, data):
+                pass
+
         class FakeCoordinator:
             mounted_provider = None
+            hooks = FakeHooks()
 
             async def mount(self, slot, provider, name=None):
                 self.mounted_provider = provider
+
+            def register_contributor(self, channel, name, callback):
+                pass
 
         coordinator = FakeCoordinator()
 

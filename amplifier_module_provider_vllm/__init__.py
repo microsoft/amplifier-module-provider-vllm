@@ -15,6 +15,7 @@ import os
 import time
 import uuid
 from collections import defaultdict
+from decimal import Decimal
 from typing import Any
 from urllib.parse import urlparse
 
@@ -44,6 +45,7 @@ from ._constants import MAX_CONTINUATION_ATTEMPTS
 from ._constants import METADATA_INCOMPLETE_REASON
 from ._constants import METADATA_RESPONSE_ID
 from ._constants import METADATA_STATUS
+from ._cost import compute_cost
 from ._response_handling import convert_response_with_accumulated_output
 from ._token_accounting import apply_token_accounting
 from ._token_accounting import should_apply_token_accounting
@@ -127,10 +129,26 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     # API key from config or environment (for auth proxies)
     api_key = config.get("api_key") or os.environ.get("VLLM_API_KEY", "EMPTY")
 
+    _totals: dict[str, Any] = {"cost_usd": Decimal(0), "has_data": False}
+
+    def _add_cost(cost: Decimal | None) -> None:
+        if cost is not None:
+            _totals["cost_usd"] += cost
+            _totals["has_data"] = True
+
     provider = VLLMProvider(
-        base_url=base_url, api_key=api_key, config=config, coordinator=coordinator
+        base_url=base_url,
+        api_key=api_key,
+        config=config,
+        coordinator=coordinator,
+        add_cost=_add_cost,
     )
     await coordinator.mount("providers", provider, name="vllm")
+    coordinator.register_contributor(
+        "session.cost",
+        "provider-vllm",
+        lambda: {"cost_usd": _totals["cost_usd"]} if _totals["has_data"] else None,
+    )
     logger.info(f"Mounted VLLMProvider (Responses API) at {base_url}")
 
     # Return cleanup function
@@ -154,6 +172,7 @@ class VLLMProvider:
         config: dict[str, Any] | None = None,
         coordinator: ModuleCoordinator | None = None,
         client: AsyncOpenAI | None = None,
+        add_cost=None,
     ):
         """Initialize vLLM provider with Responses API client.
 
@@ -172,6 +191,7 @@ class VLLMProvider:
         self.coordinator = coordinator
         self.base_url = base_url
         self.api_key = api_key
+        self._add_cost = add_cost or (lambda cost: None)
 
         # Cache is_remote at construction so we don't re-parse the URL on
         # every property access (used in capabilities tagging, default
@@ -1110,7 +1130,12 @@ class VLLMProvider:
                     event_usage["input_tokens"] = chat_response.usage.input_tokens
                     event_usage["output_tokens"] = chat_response.usage.output_tokens
                     if chat_response.usage.cache_read_tokens is not None:
-                        event_usage["cache_read_tokens"] = chat_response.usage.cache_read_tokens
+                        event_usage["cache_read_tokens"] = (
+                            chat_response.usage.cache_read_tokens
+                        )
+                    event_usage["cost_usd"] = getattr(
+                        chat_response.usage, "cost_usd", None
+                    )
                 response_event: dict[str, Any] = {
                     "provider": self.name,
                     "model": params["model"],
@@ -1691,6 +1716,16 @@ class VLLMProvider:
             reasoning_tokens=reasoning_tokens,
             cache_read_tokens=cache_read_tokens,
         )
+
+        # Stamp cost_usd — vLLM is self-hosted so cost is always indeterminate (None).
+        model_id = getattr(response, "model", "")
+        cost = compute_cost(
+            model_id,
+            input_tokens=usage_counts["input"],
+            output_tokens=usage_counts["output"],
+        )
+        usage = usage.model_copy(update={"cost_usd": cost})
+        self._add_cost(cost)
 
         combined_text = "\n\n".join(text_accumulator).strip()
 
