@@ -129,10 +129,26 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     # API key from config or environment (for auth proxies)
     api_key = config.get("api_key") or os.environ.get("VLLM_API_KEY", "EMPTY")
 
+    _totals: dict[str, Any] = {"cost_usd": Decimal(0), "has_data": False}
+
+    def _add_cost(cost: Decimal | None) -> None:
+        if cost is not None:
+            _totals["cost_usd"] += cost
+            _totals["has_data"] = True
+
     provider = VLLMProvider(
-        base_url=base_url, api_key=api_key, config=config, coordinator=coordinator
+        base_url=base_url,
+        api_key=api_key,
+        config=config,
+        coordinator=coordinator,
+        add_cost=_add_cost,
     )
     await coordinator.mount("providers", provider, name="vllm")
+    coordinator.register_contributor(
+        "session.cost",
+        "provider-vllm",
+        lambda: {"cost_usd": _totals["cost_usd"]} if _totals["has_data"] else None,
+    )
     logger.info(f"Mounted VLLMProvider (Responses API) at {base_url}")
 
     # Return cleanup function
@@ -156,6 +172,7 @@ class VLLMProvider:
         config: dict[str, Any] | None = None,
         coordinator: ModuleCoordinator | None = None,
         client: AsyncOpenAI | None = None,
+        add_cost=None,
     ):
         """Initialize vLLM provider with Responses API client.
 
@@ -174,6 +191,7 @@ class VLLMProvider:
         self.coordinator = coordinator
         self.base_url = base_url
         self.api_key = api_key
+        self._add_cost = add_cost or (lambda cost: None)
 
         # Cache is_remote at construction so we don't re-parse the URL on
         # every property access (used in capabilities tagging, default
@@ -1707,6 +1725,7 @@ class VLLMProvider:
             output_tokens=usage_counts["output"],
         )
         usage = usage.model_copy(update={"cost_usd": cost})
+        self._add_cost(cost)
 
         combined_text = "\n\n".join(text_accumulator).strip()
 
