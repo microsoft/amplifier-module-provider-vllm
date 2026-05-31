@@ -233,6 +233,11 @@ class VLLMProvider:
         self.raw = self.config.get("raw", False)  # Include raw API I/O in base events
         self.timeout = self.config.get("timeout", DEFAULT_TIMEOUT)
 
+        # Streaming flag — when True (default), emits llm:stream_* contract events
+        # via chunked HTTP transport. Set to False to use the blocking create() path
+        # (useful for background tasks like session-namer that must NOT stream).
+        self.use_streaming = self.config.get("use_streaming", True)
+
         # Provider priority for selection (lower = higher priority)
         self.priority = self.config.get("priority", 100)
 
@@ -843,6 +848,26 @@ class VLLMProvider:
 
         start_time = time.time()
 
+        # Per-request streaming override (does NOT mutate self.use_streaming).
+        # Callers like session-namer pass metadata={"stream": False} to force
+        # the blocking create() path and suppress llm:stream_* events.
+        _meta = getattr(request, "metadata", None)
+        _use_streaming = self.use_streaming
+        if isinstance(_meta, dict) and _meta.get("stream") is False:
+            _use_streaming = False
+
+        # Hot-loop optimisation: evaluate the coordinator guard once.
+        hooks_available = bool(self.coordinator and hasattr(self.coordinator, "hooks"))
+
+        # Mutable dict shared between _do_complete (first streaming round) and the
+        # continuation loop (subsequent rounds).  Keys populated on first success:
+        #   request_id        – stable uuid4 for the whole logical call
+        #   seq               – {block_index: next_sequence_number}
+        #   block_types       – {block_index: "text"|"thinking"|"tool_use"}
+        #   partial_emitted   – True once any delta was sent
+        #   block_index_offset – advances after each round
+        _stream_state: dict = {}
+
         # Call provider API with shared retry_with_backoff from amplifier-core.
         # Error translation happens inside _do_complete() so that retry_with_backoff
         # sees LLMError (and checks retryable) rather than raw SDK exceptions.
@@ -850,9 +875,132 @@ class VLLMProvider:
         async def _do_complete():
             """Single API call attempt with SDK → kernel error translation."""
             try:
-                return await asyncio.wait_for(
-                    self.client.responses.create(**params), timeout=self.timeout
-                )
+                if _use_streaming:
+                    # -------------------------------------------------------
+                    # Streaming path — first round
+                    # Emits llm:stream_block_start/delta/end/thinking_delta
+                    # per the provider streaming contract.
+                    # State is persisted to _stream_state for the continuation
+                    # loop to reuse the same request_id and advance block_index.
+                    # -------------------------------------------------------
+                    request_id = str(uuid.uuid4())
+                    seq: dict[int, int] = {}
+                    block_types_local: dict[int, str] = {}
+                    partial_emitted = False
+                    offset = _stream_state.get("block_index_offset", 0)
+
+                    try:
+                        async with asyncio.timeout(self.timeout):
+                            async with self.client.responses.stream(**params) as stream:
+                                if hooks_available:
+                                    async for event in stream:
+                                        et = event.type
+
+                                        if et == "response.output_item.added":
+                                            idx = event.output_index + offset
+                                            item_type = getattr(event.item, "type", None)
+                                            block_type = {
+                                                "message": "text",
+                                                "reasoning": "thinking",
+                                                "function_call": "tool_use",
+                                            }.get(item_type, "text")
+                                            block_types_local[idx] = block_type
+                                            seq[idx] = 0
+                                            payload: dict[str, Any] = {
+                                                "request_id": request_id,
+                                                "block_index": idx,
+                                                "block_type": block_type,
+                                            }
+                                            if block_type == "tool_use":
+                                                name = getattr(event.item, "name", None)
+                                                if name:
+                                                    payload["name"] = name
+                                            await self.coordinator.hooks.emit(
+                                                "llm:stream_block_start", payload
+                                            )
+
+                                        elif et == "response.output_text.delta":
+                                            text = event.delta
+                                            if text:
+                                                idx = event.output_index + offset
+                                                await self.coordinator.hooks.emit(
+                                                    "llm:stream_block_delta",
+                                                    {
+                                                        "request_id": request_id,
+                                                        "block_index": idx,
+                                                        "sequence": seq.get(idx, 0),
+                                                        "text": text,
+                                                    },
+                                                )
+                                                seq[idx] = seq.get(idx, 0) + 1
+                                                partial_emitted = True
+
+                                        elif et in (
+                                            "response.reasoning_summary_text.delta",
+                                            "response.reasoning_text.delta",
+                                        ):
+                                            text = event.delta
+                                            if text:
+                                                idx = event.output_index + offset
+                                                await self.coordinator.hooks.emit(
+                                                    "llm:stream_thinking_delta",
+                                                    {
+                                                        "request_id": request_id,
+                                                        "block_index": idx,
+                                                        "sequence": seq.get(idx, 0),
+                                                        "text": text,
+                                                    },
+                                                )
+                                                seq[idx] = seq.get(idx, 0) + 1
+                                                partial_emitted = True
+
+                                        elif et == "response.output_item.done":
+                                            idx = event.output_index + offset
+                                            if idx in block_types_local:
+                                                await self.coordinator.hooks.emit(
+                                                    "llm:stream_block_end",
+                                                    {
+                                                        "request_id": request_id,
+                                                        "block_index": idx,
+                                                        "block_type": block_types_local[idx],
+                                                    },
+                                                )
+
+                                round_response = await stream.get_final_response()
+
+                        # Persist state for outer continuation access
+                        _stream_state["request_id"] = request_id
+                        _stream_state["partial_emitted"] = partial_emitted
+                        _stream_state["seq"] = seq
+                        _stream_state["block_types"] = block_types_local
+                        # Advance offset: next round blocks start above current max
+                        if block_types_local:
+                            _stream_state["block_index_offset"] = max(block_types_local.keys()) + 1
+                        else:
+                            _stream_state.setdefault("block_index_offset", 0)
+
+                        return round_response
+
+                    except Exception as e:
+                        if partial_emitted and hooks_available:
+                            await self.coordinator.hooks.emit(
+                                "llm:stream_aborted",
+                                {
+                                    "request_id": request_id,
+                                    "error": {
+                                        "type": type(e).__name__,
+                                        "msg": str(e),
+                                    },
+                                },
+                            )
+                        raise
+
+                else:
+                    # Non-streaming fallback — preserved for backward compat and
+                    # for callers that pass metadata={"stream": False}.
+                    return await asyncio.wait_for(
+                        self.client.responses.create(**params), timeout=self.timeout
+                    )
             except openai.RateLimitError as e:
                 retry_after = None
                 if hasattr(e, "response") and e.response is not None:
@@ -1085,13 +1233,110 @@ class VLLMProvider:
                 if "store" in params:
                     continue_params["store"] = params["store"]
 
-                # Make continuation call
+                # Make continuation call (streaming or blocking)
                 try:
                     continue_start = time.time()
-                    final_response = await asyncio.wait_for(
-                        self.client.responses.create(**continue_params),
-                        timeout=self.timeout,
-                    )
+                    if _use_streaming:
+                        # -------------------------------------------------------
+                        # Streaming continuation round
+                        # Reuses request_id from _stream_state (same logical call).
+                        # block_index_offset advances so renderer sees one sequence.
+                        # -------------------------------------------------------
+                        cont_request_id = _stream_state.get("request_id", str(uuid.uuid4()))
+                        cont_seq = _stream_state.get("seq", {})
+                        cont_block_types = _stream_state.get("block_types", {})
+                        cont_offset = _stream_state.get("block_index_offset", 0)
+                        cont_partial = _stream_state.get("partial_emitted", False)
+
+                        async with asyncio.timeout(self.timeout):
+                            async with self.client.responses.stream(**continue_params) as cont_stream:
+                                if hooks_available:
+                                    async for event in cont_stream:
+                                        et = event.type
+
+                                        if et == "response.output_item.added":
+                                            idx = event.output_index + cont_offset
+                                            item_type = getattr(event.item, "type", None)
+                                            block_type = {
+                                                "message": "text",
+                                                "reasoning": "thinking",
+                                                "function_call": "tool_use",
+                                            }.get(item_type, "text")
+                                            cont_block_types[idx] = block_type
+                                            cont_seq[idx] = 0
+                                            cont_payload: dict[str, Any] = {
+                                                "request_id": cont_request_id,
+                                                "block_index": idx,
+                                                "block_type": block_type,
+                                            }
+                                            if block_type == "tool_use":
+                                                cont_name = getattr(event.item, "name", None)
+                                                if cont_name:
+                                                    cont_payload["name"] = cont_name
+                                            await self.coordinator.hooks.emit(
+                                                "llm:stream_block_start", cont_payload
+                                            )
+
+                                        elif et == "response.output_text.delta":
+                                            text = event.delta
+                                            if text:
+                                                idx = event.output_index + cont_offset
+                                                await self.coordinator.hooks.emit(
+                                                    "llm:stream_block_delta",
+                                                    {
+                                                        "request_id": cont_request_id,
+                                                        "block_index": idx,
+                                                        "sequence": cont_seq.get(idx, 0),
+                                                        "text": text,
+                                                    },
+                                                )
+                                                cont_seq[idx] = cont_seq.get(idx, 0) + 1
+                                                cont_partial = True
+
+                                        elif et in (
+                                            "response.reasoning_summary_text.delta",
+                                            "response.reasoning_text.delta",
+                                        ):
+                                            text = event.delta
+                                            if text:
+                                                idx = event.output_index + cont_offset
+                                                await self.coordinator.hooks.emit(
+                                                    "llm:stream_thinking_delta",
+                                                    {
+                                                        "request_id": cont_request_id,
+                                                        "block_index": idx,
+                                                        "sequence": cont_seq.get(idx, 0),
+                                                        "text": text,
+                                                    },
+                                                )
+                                                cont_seq[idx] = cont_seq.get(idx, 0) + 1
+                                                cont_partial = True
+
+                                        elif et == "response.output_item.done":
+                                            idx = event.output_index + cont_offset
+                                            if idx in cont_block_types:
+                                                await self.coordinator.hooks.emit(
+                                                    "llm:stream_block_end",
+                                                    {
+                                                        "request_id": cont_request_id,
+                                                        "block_index": idx,
+                                                        "block_type": cont_block_types[idx],
+                                                    },
+                                                )
+
+                                final_response = await cont_stream.get_final_response()
+
+                        # Update shared streaming state for next continuation round
+                        _stream_state["partial_emitted"] = cont_partial
+                        if cont_block_types:
+                            _stream_state["block_index_offset"] = max(cont_block_types.keys()) + 1
+                    else:
+                        # Non-streaming continuation fallback
+                        final_response = await asyncio.wait_for(
+                            self.client.responses.create(**continue_params),
+                            timeout=self.timeout,
+                        )
+
                     continue_elapsed = int((time.time() - continue_start) * 1000)
                     elapsed_ms += continue_elapsed
 
