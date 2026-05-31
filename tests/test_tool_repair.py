@@ -38,7 +38,7 @@ class FakeCoordinator:
 
 def test_tool_call_sequence_missing_tool_message_is_repaired():
     """Missing tool results should be repaired with synthetic results and emit event."""
-    provider = VLLMProvider(base_url="http://localhost:8000/v1")
+    provider = VLLMProvider(base_url="http://localhost:8000/v1", config={"max_retries": 0, "use_streaming": False})
     provider.client.responses.create = AsyncMock(return_value=DummyResponse())
     fake_coordinator = FakeCoordinator()
     provider.coordinator = cast(ModuleCoordinator, fake_coordinator)
@@ -88,7 +88,7 @@ def test_repaired_tool_ids_are_not_detected_again():
 
     The fix tracks repaired tool IDs to skip re-detection.
     """
-    provider = VLLMProvider(base_url="http://localhost:8000/v1")
+    provider = VLLMProvider(base_url="http://localhost:8000/v1", config={"max_retries": 0, "use_streaming": False})
     provider.client.responses.create = AsyncMock(return_value=DummyResponse())
     fake_coordinator = FakeCoordinator()
     provider.coordinator = cast(ModuleCoordinator, fake_coordinator)
@@ -146,7 +146,7 @@ def test_repaired_tool_ids_are_not_detected_again():
 
 def test_multiple_missing_tool_results_all_tracked():
     """Multiple missing tool results should all be tracked to prevent infinite loops."""
-    provider = VLLMProvider(base_url="http://localhost:8000/v1")
+    provider = VLLMProvider(base_url="http://localhost:8000/v1", config={"max_retries": 0, "use_streaming": False})
     provider.client.responses.create = AsyncMock(return_value=DummyResponse())
     fake_coordinator = FakeCoordinator()
     provider.coordinator = cast(ModuleCoordinator, fake_coordinator)
@@ -192,7 +192,7 @@ def test_synthetic_result_inserted_at_correct_position_not_appended():
     synthetic tool result AFTER any subsequent user messages.  The fix uses
     insert(msg_idx + 1, ...) to keep the result in the correct position.
     """
-    provider = VLLMProvider(base_url="http://localhost:8000/v1")
+    provider = VLLMProvider(base_url="http://localhost:8000/v1", config={"max_retries": 0, "use_streaming": False})
     provider.client.responses.create = AsyncMock(return_value=DummyResponse())
 
     messages = [
@@ -227,7 +227,7 @@ def test_fm3_synthetic_assistant_inserted_between_tool_result_and_user_message()
     invalid (tool → user with no assistant in between).  FM3 inserts a synthetic
     assistant acknowledgment to restore the required turn order.
     """
-    provider = VLLMProvider(base_url="http://localhost:8000/v1")
+    provider = VLLMProvider(base_url="http://localhost:8000/v1", config={"max_retries": 0, "use_streaming": False})
     provider.client.responses.create = AsyncMock(return_value=DummyResponse())
 
     messages = [
@@ -254,7 +254,7 @@ def test_no_fm3_when_no_user_message_follows_tool_result():
     If the tool call is the final assistant turn (no subsequent user message),
     inserting a synthetic assistant turn would be incorrect and wasteful.
     """
-    provider = VLLMProvider(base_url="http://localhost:8000/v1")
+    provider = VLLMProvider(base_url="http://localhost:8000/v1", config={"max_retries": 0, "use_streaming": False})
     provider.client.responses.create = AsyncMock(return_value=DummyResponse())
 
     # Tool call is the last meaningful message — no user message follows
@@ -284,7 +284,7 @@ def test_multiple_groups_inserted_at_correct_positions():
     must insert each synthetic result directly after its own assistant message, preserving
     the full conversation order.
     """
-    provider = VLLMProvider(base_url="http://localhost:8000/v1")
+    provider = VLLMProvider(base_url="http://localhost:8000/v1", config={"max_retries": 0, "use_streaming": False})
     provider.client.responses.create = AsyncMock(return_value=DummyResponse())
 
     messages = [

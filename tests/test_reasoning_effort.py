@@ -37,7 +37,7 @@ class DummyResponse:
 
 
 def _make_provider(**config_overrides) -> VLLMProvider:
-    config = {"max_retries": 0, **config_overrides}
+    config = {"max_retries": 0, **config_overrides, "use_streaming": False}
     provider = VLLMProvider(base_url="http://localhost:8000/v1", config=config)
     provider.client.responses.create = AsyncMock(return_value=DummyResponse())
     return provider

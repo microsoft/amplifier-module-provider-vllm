@@ -102,7 +102,7 @@ def _make_dummy_response(
 
 
 def _make_provider() -> VLLMProvider:
-    config = {"max_retries": 0, "default_model": "meta-llama/Llama-3-8B"}
+    config = {"max_retries": 0, "default_model": "meta-llama/Llama-3-8B", "use_streaming": False}
     return VLLMProvider(base_url="http://localhost:8000/v1", config=config)
 
 

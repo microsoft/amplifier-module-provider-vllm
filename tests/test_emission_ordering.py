@@ -67,6 +67,8 @@ def _make_provider(**config_overrides) -> VLLMProvider:
         "max_retries": 0,
         "default_model": "meta-llama/Llama-3-8B",
         "raw": True,  # Enable raw field in events
+        # Force non-streaming path: these tests mock responses.create, not responses.stream
+        "use_streaming": False,
         **config_overrides,
     }
     return VLLMProvider(base_url="http://localhost:8000/v1", config=config)

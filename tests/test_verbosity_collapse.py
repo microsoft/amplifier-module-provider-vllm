@@ -47,7 +47,7 @@ class FakeCoordinator:
 
 
 def _make_provider(*, raw: bool = False) -> VLLMProvider:
-    config: dict = {"max_retries": 0}
+    config: dict = {"max_retries": 0, "use_streaming": False}
     if raw:
         config["raw"] = True
     provider = VLLMProvider(

@@ -21,7 +21,8 @@ from amplifier_module_provider_vllm import VLLMProvider
 def _make_provider() -> VLLMProvider:
     # Use a non-GPT-OSS model to bypass Harmony token accounting
     # (which overrides usage values for gpt-oss models)
-    config = {"max_retries": 0, "default_model": "meta-llama/Llama-3-8B"}
+    # Force non-streaming path: these tests mock responses.create, not responses.stream
+    config = {"max_retries": 0, "default_model": "meta-llama/Llama-3-8B", "use_streaming": False}
     return VLLMProvider(base_url="http://localhost:8000/v1", config=config)
 
 

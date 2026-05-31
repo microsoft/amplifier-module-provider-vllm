@@ -54,6 +54,8 @@ def _make_provider(**config_overrides) -> VLLMProvider:
         "max_retries": 3,
         "min_retry_delay": 0.01,
         "max_retry_delay": 1.0,
+        # Force non-streaming path: these tests mock responses.create, not responses.stream
+        "use_streaming": False,
         **config_overrides,
     }
     provider = VLLMProvider(base_url="http://localhost:8000/v1", config=config)
