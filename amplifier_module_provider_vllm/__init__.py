@@ -878,8 +878,9 @@ class VLLMProvider:
                 if _use_streaming:
                     # -------------------------------------------------------
                     # Streaming path — first round
-                    # Emits llm:stream_block_start/delta/end/thinking_delta
-                    # per the provider streaming contract.
+                    # Emits llm:stream_block_start/delta/end per the provider
+                    # streaming contract. ONE delta event for all content;
+                    # block_type ("text"|"thinking") carried on every delta.
                     # State is persisted to _stream_state for the continuation
                     # loop to reuse the same request_id and advance block_index.
                     # -------------------------------------------------------
@@ -928,6 +929,7 @@ class VLLMProvider:
                                                     {
                                                         "request_id": request_id,
                                                         "block_index": idx,
+                                                        "block_type": block_types_local.get(idx, "text"),
                                                         "sequence": seq.get(idx, 0),
                                                         "text": text,
                                                     },
@@ -943,10 +945,11 @@ class VLLMProvider:
                                             if text:
                                                 idx = event.output_index + offset
                                                 await self.coordinator.hooks.emit(
-                                                    "llm:stream_thinking_delta",
+                                                    "llm:stream_block_delta",
                                                     {
                                                         "request_id": request_id,
                                                         "block_index": idx,
+                                                        "block_type": "thinking",
                                                         "sequence": seq.get(idx, 0),
                                                         "text": text,
                                                     },
@@ -1286,6 +1289,7 @@ class VLLMProvider:
                                                     {
                                                         "request_id": cont_request_id,
                                                         "block_index": idx,
+                                                        "block_type": cont_block_types.get(idx, "text"),
                                                         "sequence": cont_seq.get(idx, 0),
                                                         "text": text,
                                                     },
@@ -1301,10 +1305,11 @@ class VLLMProvider:
                                             if text:
                                                 idx = event.output_index + cont_offset
                                                 await self.coordinator.hooks.emit(
-                                                    "llm:stream_thinking_delta",
+                                                    "llm:stream_block_delta",
                                                     {
                                                         "request_id": cont_request_id,
                                                         "block_index": idx,
+                                                        "block_type": "thinking",
                                                         "sequence": cont_seq.get(idx, 0),
                                                         "text": text,
                                                     },

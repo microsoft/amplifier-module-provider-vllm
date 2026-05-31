@@ -189,6 +189,8 @@ def test_text_stream_emits_block_start_deltas_block_end():
     assert starts[0]["block_index"] == 0
     assert deltas[0]["sequence"] == 0
     assert deltas[1]["sequence"] == 1
+    assert deltas[0]["block_type"] == "text"
+    assert deltas[1]["block_type"] == "text"
     assert ends[0]["block_type"] == "text"
     assert ends[0]["block_index"] == 0
 
@@ -215,8 +217,8 @@ def test_block_index_consistent_across_event_types():
 # ---------------------------------------------------------------------------
 
 
-def test_reasoning_summary_delta_emits_thinking_delta():
-    """response.reasoning_summary_text.delta -> llm:stream_thinking_delta."""
+def test_reasoning_summary_delta_emits_block_delta_with_thinking():
+    """response.reasoning_summary_text.delta -> llm:stream_block_delta with block_type='thinking'."""
     provider = _make_provider()
     reasoning_item = _fake_item("reasoning")
     events = [
@@ -228,7 +230,7 @@ def test_reasoning_summary_delta_emits_thinking_delta():
     asyncio.run(provider.complete(_simple_request()))
 
     h = provider.coordinator.hooks  # type: ignore[union-attr]
-    td = h.payloads_for("llm:stream_thinking_delta")
+    td = [p for p in h.payloads_for("llm:stream_block_delta") if p.get("block_type") == "thinking"]
     assert len(td) == 1
     assert td[0]["text"] == "I am thinking..."
     assert "request_id" in td[0]
@@ -236,8 +238,8 @@ def test_reasoning_summary_delta_emits_thinking_delta():
     assert "sequence" in td[0]
 
 
-def test_reasoning_text_delta_also_emits_thinking_delta():
-    """response.reasoning_text.delta (vLLM full-reasoning variant) -> thinking_delta."""
+def test_reasoning_text_delta_also_emits_block_delta():
+    """response.reasoning_text.delta (vLLM full-reasoning variant) -> block_delta with block_type='thinking'."""
     provider = _make_provider()
     item = _fake_item("reasoning")
     events = [
@@ -249,13 +251,13 @@ def test_reasoning_text_delta_also_emits_thinking_delta():
     asyncio.run(provider.complete(_simple_request()))
 
     h = provider.coordinator.hooks  # type: ignore[union-attr]
-    td = h.payloads_for("llm:stream_thinking_delta")
+    td = [p for p in h.payloads_for("llm:stream_block_delta") if p.get("block_type") == "thinking"]
     assert len(td) == 1
     assert td[0]["text"] == "deep thought"
 
 
 def test_thinking_delta_sequence_per_block():
-    """Sequence counter for thinking_delta is per-block and starts at 0."""
+    """Sequence counter for thinking block_delta is per-block and starts at 0."""
     provider = _make_provider()
     item = _fake_item("reasoning")
     events = [
@@ -267,7 +269,11 @@ def test_thinking_delta_sequence_per_block():
     _install_fake_stream(provider, FakeStream(events, _make_response()))
     asyncio.run(provider.complete(_simple_request()))
 
-    seqs = [d["sequence"] for d in provider.coordinator.hooks.payloads_for("llm:stream_thinking_delta")]  # type: ignore[union-attr]
+    seqs = [
+        d["sequence"]
+        for d in provider.coordinator.hooks.payloads_for("llm:stream_block_delta")  # type: ignore[union-attr]
+        if d.get("block_type") == "thinking"
+    ]
     assert seqs == [0, 1]
 
 
@@ -508,6 +514,7 @@ def test_empty_text_delta_skipped():
     deltas = provider.coordinator.hooks.payloads_for("llm:stream_block_delta")  # type: ignore[union-attr]
     assert len(deltas) == 1
     assert deltas[0]["text"] == "real"
+    assert deltas[0]["block_type"] == "text"
 
 
 def test_empty_thinking_delta_skipped():
@@ -523,7 +530,10 @@ def test_empty_thinking_delta_skipped():
     _install_fake_stream(provider, FakeStream(events, _make_response()))
     asyncio.run(provider.complete(_simple_request()))
 
-    thinking = provider.coordinator.hooks.payloads_for("llm:stream_thinking_delta")  # type: ignore[union-attr]
+    thinking = [
+        p for p in provider.coordinator.hooks.payloads_for("llm:stream_block_delta")  # type: ignore[union-attr]
+        if p.get("block_type") == "thinking"
+    ]
     assert len(thinking) == 1
     assert thinking[0]["text"] == "thought"
 
