@@ -20,6 +20,15 @@ DEFAULT_DEBUG_TRUNCATE_LENGTH = 180
 DEFAULT_TIMEOUT = 600.0  # 10 minutes
 DEFAULT_TRUNCATION = "auto"  # Automatic context management
 
+# Advertised model limits for downstream context managers.
+# vLLM does not expose context length via /v1/models, so these defaults are
+# used unless overridden per provider instance (config keys context_window /
+# max_output_tokens, or VLLM_CONTEXT_WINDOW / VLLM_MAX_OUTPUT_TOKENS env vars).
+# Note: DEFAULT_MAX_OUTPUT_TOKENS is the advertised model maximum (used for
+# token budgeting), NOT the per-request completion cap (DEFAULT_MAX_TOKENS).
+DEFAULT_CONTEXT_WINDOW = 128000
+DEFAULT_MAX_OUTPUT_TOKENS = 32768
+
 # Maximum number of continuation attempts for incomplete responses
 # This prevents infinite loops while being generous enough for legitimate large responses
 MAX_CONTINUATION_ATTEMPTS = 5
