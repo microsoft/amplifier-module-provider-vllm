@@ -82,6 +82,7 @@ providers:
       enable_state: false                   # Server-side state (requires vLLM config)
       truncation: "auto"                    # Automatic context management
       timeout: 300.0                        # API timeout (seconds)
+      stream_idle_timeout: 300.0            # Max seconds between streamed chunks (see below)
       priority: 100                         # Provider selection priority
 
       # Debug
@@ -89,6 +90,25 @@ providers:
       raw_debug: false                      # Enable raw API I/O logging
       debug_truncate_length: 180            # Truncate long debug strings
 ```
+
+### Stream idle timeout
+
+`stream_idle_timeout` bounds how long the provider waits **between streamed
+chunks** — including the wait for the *first* chunk — before aborting the
+stream with a retryable timeout error.
+
+- **Default**: `300.0` seconds (5 minutes)
+- **Env var**: `VLLM_STREAM_IDLE_TIMEOUT` (config value takes precedence)
+
+Why it exists: remote vLLM endpoints behind hosted-GPU HTTPS proxies
+(RunPod et al.) routinely drop quiet connections *without close*. Before
+this knob, a mid-generation drop raised no exception and left the session
+hanging silently forever (observed: ~8.7 hours mid-turn). The default is
+deliberately generous because this endpoint class legitimately has long
+time-to-first-token during prefill of 60–90k-token prompts — minutes, not
+seconds — so the window must never false-positive on a healthy long
+prefill while still guaranteeing a hung stream surfaces as a retryable
+error. Non-streaming calls are unaffected (bounded by `timeout`).
 
 ### Local vs remote — single source of truth
 

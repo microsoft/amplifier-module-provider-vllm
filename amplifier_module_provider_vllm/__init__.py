@@ -39,6 +39,7 @@ from openai import AsyncOpenAI
 from ._constants import DEFAULT_MAX_TOKENS
 from ._constants import DEFAULT_MODEL
 from ._constants import DEFAULT_REASONING_SUMMARY
+from ._constants import DEFAULT_STREAM_IDLE_TIMEOUT
 from ._constants import DEFAULT_TIMEOUT
 from ._constants import DEFAULT_TRUNCATION
 from ._constants import MAX_CONTINUATION_ATTEMPTS
@@ -233,6 +234,16 @@ class VLLMProvider:
         self.raw = self.config.get("raw", False)  # Include raw API I/O in base events
         self.timeout = self.config.get("timeout", DEFAULT_TIMEOUT)
 
+        # Inter-chunk idle timeout for streaming (seconds).
+        # Resolution: config -> VLLM_STREAM_IDLE_TIMEOUT env var -> default
+        # constant (same pattern as base_url/api_key). See _constants.py for
+        # the default's rationale (long prefill TTFT vs never-hang-forever).
+        self.stream_idle_timeout = float(
+            self.config.get("stream_idle_timeout")
+            or os.environ.get("VLLM_STREAM_IDLE_TIMEOUT")
+            or DEFAULT_STREAM_IDLE_TIMEOUT
+        )
+
         # Streaming flag — when True (default), emits llm:stream_* contract events
         # via chunked HTTP transport. Set to False to use the blocking create() path
         # (useful for background tasks like session-namer that must NOT stream).
@@ -364,6 +375,23 @@ class VLLMProvider:
                     default="EMPTY",
                     required=False,
                 ),
+                # Inter-chunk idle timeout for streaming. Bounds the wait for
+                # every chunk (including the first) so a connection dropped
+                # without close by a hosted-GPU proxy surfaces as a retryable
+                # timeout instead of hanging the session forever (#339).
+                ConfigField(
+                    id="stream_idle_timeout",
+                    display_name="Stream Idle Timeout",
+                    prompt=(
+                        "Max seconds to wait between streamed chunks before "
+                        "aborting (generous: long prefill on 60-90k-token "
+                        "prompts legitimately takes minutes)"
+                    ),
+                    field_type="text",
+                    env_var="VLLM_STREAM_IDLE_TIMEOUT",
+                    default=str(DEFAULT_STREAM_IDLE_TIMEOUT),
+                    required=False,
+                ),
             ],
         )
 
@@ -396,6 +424,36 @@ class VLLMProvider:
                 )
             )
         return models
+
+    async def _iter_with_idle_timeout(self, stream):
+        """Yield stream events, bounding the wait between chunks.
+
+        Hosted-GPU HTTPS proxies (RunPod et al.) drop quiet connections
+        without FIN, leaving an established stream silently hung: no chunk,
+        no exception, forever. This wrapper bounds the wait for EVERY chunk
+        — including the FIRST (a hang before the first chunk is the same
+        failure mode) — and aborts with a retryable LLMTimeoutError so that
+        upstream retry logic (retry_with_backoff) engages instead of the
+        session hanging indefinitely. See microsoft/amplifier#339.
+        """
+        iterator = stream.__aiter__()
+        while True:
+            try:
+                event = await asyncio.wait_for(
+                    iterator.__anext__(), timeout=self.stream_idle_timeout
+                )
+            except StopAsyncIteration:
+                return
+            except asyncio.TimeoutError as e:
+                raise kernel_errors.LLMTimeoutError(
+                    f"Streaming response stalled: no chunk received for "
+                    f"{self.stream_idle_timeout}s (stream_idle_timeout). "
+                    f"Likely a dropped connection (proxy killed the stream "
+                    f"without close). Aborting so the attempt can be retried.",
+                    provider=self.name,
+                    retryable=True,
+                ) from e
+            yield event
 
     def _build_continuation_input(
         self, original_input: list, accumulated_output: list
@@ -893,8 +951,8 @@ class VLLMProvider:
                     try:
                         async with asyncio.timeout(self.timeout):
                             async with self.client.responses.stream(**params) as stream:
-                                if hooks_available:
-                                    async for event in stream:
+                                async for event in self._iter_with_idle_timeout(stream):
+                                    if hooks_available:
                                         et = event.type
 
                                         if et == "response.output_item.added":
@@ -1253,8 +1311,10 @@ class VLLMProvider:
 
                         async with asyncio.timeout(self.timeout):
                             async with self.client.responses.stream(**continue_params) as cont_stream:
-                                if hooks_available:
-                                    async for event in cont_stream:
+                                async for event in self._iter_with_idle_timeout(
+                                    cont_stream
+                                ):
+                                    if hooks_available:
                                         et = event.type
 
                                         if et == "response.output_item.added":
