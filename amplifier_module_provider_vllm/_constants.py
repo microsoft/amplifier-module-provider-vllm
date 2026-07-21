@@ -20,6 +20,21 @@ DEFAULT_DEBUG_TRUNCATE_LENGTH = 180
 DEFAULT_TIMEOUT = 600.0  # 10 minutes
 DEFAULT_TRUNCATION = "auto"  # Automatic context management
 
+# Inter-chunk idle timeout for streaming responses (seconds).
+#
+# Bounds the wait for EVERY chunk on an established stream — including the
+# FIRST one (a hang before the first chunk is the same failure mode).
+# Remote vLLM endpoints behind hosted-GPU HTTPS proxies (RunPod et al.)
+# routinely drop quiet connections without FIN, which previously left a
+# stream hanging silently forever (observed: ~8.7 hours mid-turn).
+#
+# Why 300s and not something aggressive like 30s: this endpoint class
+# legitimately has long time-to-first-token during prefill of 60-90k-token
+# prompts (minutes, not seconds). The default must never false-positive on
+# a healthy long prefill, while still guaranteeing a hung stream surfaces
+# as a retryable error instead of hanging forever.
+DEFAULT_STREAM_IDLE_TIMEOUT = 300.0  # 5 minutes
+
 # Advertised model limits for downstream context managers.
 # vLLM does not expose context length via /v1/models, so these defaults are
 # used unless overridden per provider instance (config keys context_window /
