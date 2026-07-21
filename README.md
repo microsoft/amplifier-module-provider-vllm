@@ -78,6 +78,10 @@ providers:
       reasoning: "high"                     # Reasoning effort: minimal|low|medium|high
       reasoning_summary: "detailed"         # Summary verbosity: auto|concise|detailed
 
+      # Context limits (advertised to context managers)
+      context_window: 128000                # Model context window in tokens
+      max_output_tokens: 32768              # Model max output tokens
+
       # Advanced
       enable_state: false                   # Server-side state (requires vLLM config)
       truncation: "auto"                    # Automatic context management
@@ -109,6 +113,22 @@ time-to-first-token during prefill of 60–90k-token prompts — minutes, not
 seconds — so the window must never false-positive on a healthy long
 prefill while still guaranteeing a hung stream surfaces as a retryable
 error. Non-streaming calls are unaffected (bounded by `timeout`).
+### Context limits
+
+vLLM does not expose the loaded model's context length via `/v1/models`,
+so the provider advertises defaults (`context_window: 128000`,
+`max_output_tokens: 32768`) to downstream context managers, which derive
+their token budget from these values. If your endpoint serves a model
+with different limits, set `context_window` and `max_output_tokens`
+(config keys above, or the `VLLM_CONTEXT_WINDOW` /
+`VLLM_MAX_OUTPUT_TOKENS` environment variables) to match your deployment.
+
+This matters for long-context deployments: with the previous hardcoded
+values (`max_output_tokens: 128000`), the effective input budget was
+capped at ~59k tokens even on endpoints that comfortably handle 120k+
+token prompts — causing premature compaction thrashing. `max_output_tokens`
+here is the advertised model maximum used for budgeting, distinct from
+`max_tokens` (the per-request completion cap).
 
 ### Local vs remote — single source of truth
 

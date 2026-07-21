@@ -36,6 +36,8 @@ from amplifier_core.message_models import ToolCall
 from amplifier_core.utils.retry import RetryConfig, retry_with_backoff
 from openai import AsyncOpenAI
 
+from ._constants import DEFAULT_CONTEXT_WINDOW
+from ._constants import DEFAULT_MAX_OUTPUT_TOKENS
 from ._constants import DEFAULT_MAX_TOKENS
 from ._constants import DEFAULT_MODEL
 from ._constants import DEFAULT_REASONING_SUMMARY
@@ -244,6 +246,23 @@ class VLLMProvider:
             or DEFAULT_STREAM_IDLE_TIMEOUT
         )
 
+        # Advertised model limits for downstream context managers (token budgeting).
+        # vLLM does not expose context length via /v1/models, so these are
+        # config-overridable per provider instance, with env-var fallbacks
+        # (same config-then-env pattern as base_url/api_key in mount()).
+        # NOTE: max_output_tokens is the advertised model maximum output —
+        # a different concept from self.max_tokens (per-request completion cap).
+        self.context_window = int(
+            self.config.get("context_window")
+            or os.environ.get("VLLM_CONTEXT_WINDOW")
+            or DEFAULT_CONTEXT_WINDOW
+        )
+        self.max_output_tokens = int(
+            self.config.get("max_output_tokens")
+            or os.environ.get("VLLM_MAX_OUTPUT_TOKENS")
+            or DEFAULT_MAX_OUTPUT_TOKENS
+        )
+
         # Streaming flag — when True (default), emits llm:stream_* contract events
         # via chunked HTTP transport. Set to False to use the blocking create() path
         # (useful for background tasks like session-namer that must NOT stream).
@@ -343,8 +362,8 @@ class VLLMProvider:
                 "max_tokens": 16384,
                 "temperature": None,
                 "timeout": 600.0,
-                "context_window": 128000,
-                "max_output_tokens": 128000,
+                "context_window": self.context_window,
+                "max_output_tokens": self.max_output_tokens,
             },
             config_fields=[
                 # base_url is the single source of truth for local-vs-remote.
@@ -392,7 +411,59 @@ class VLLMProvider:
                     default=str(DEFAULT_STREAM_IDLE_TIMEOUT),
                     required=False,
                 ),
+                # vLLM does not expose the model's context length via
+                # /v1/models, so these two fields let a deployment override
+                # the advertised limits to match its real endpoint. Downstream
+                # context managers derive their token budget from these values;
+                # leaving them at defaults on a larger endpoint needlessly
+                # caps the usable context.
+                ConfigField(
+                    id="context_window",
+                    display_name="Context Window",
+                    prompt=(
+                        "Context window in tokens advertised to the context "
+                        "manager (vLLM does not expose this via /v1/models)"
+                    ),
+                    field_type="text",
+                    env_var="VLLM_CONTEXT_WINDOW",
+                    default=str(DEFAULT_CONTEXT_WINDOW),
+                    required=False,
+                ),
+                ConfigField(
+                    id="max_output_tokens",
+                    display_name="Max Output Tokens",
+                    prompt=(
+                        "Maximum output tokens advertised to the context "
+                        "manager (model maximum, not the per-request "
+                        "max_tokens cap; vLLM does not expose this)"
+                    ),
+                    field_type="text",
+                    env_var="VLLM_MAX_OUTPUT_TOKENS",
+                    default=str(DEFAULT_MAX_OUTPUT_TOKENS),
+                    required=False,
+                ),
             ],
+        )
+
+    def get_model_info(self) -> ModelInfo:
+        """Model info for the configured default model.
+
+        Context managers (e.g. context-simple) prefer ``get_model_info()``
+        over ``get_info().defaults`` when computing their token budget, so
+        this must report the same configured (or default) limits.
+        """
+        return ModelInfo(
+            id=self.default_model,
+            display_name=self.default_model,
+            context_window=self.context_window,
+            max_output_tokens=self.max_output_tokens,
+            capabilities=[
+                "tools",
+                "streaming",
+                "reasoning",
+                "remote" if self._is_remote_cached else "local",
+            ],
+            defaults={"temperature": None, "max_tokens": 16384},
         )
 
     async def list_models(self) -> list[ModelInfo]:
@@ -412,8 +483,8 @@ class VLLMProvider:
                 ModelInfo(
                     id=model.id,
                     display_name=model.id,
-                    context_window=128000,  # Default, vLLM doesn't expose this
-                    max_output_tokens=32768,  # Default
+                    context_window=self.context_window,  # vLLM doesn't expose this
+                    max_output_tokens=self.max_output_tokens,
                     capabilities=[
                         "tools",
                         "streaming",
