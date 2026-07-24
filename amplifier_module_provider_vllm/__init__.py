@@ -336,6 +336,43 @@ class VLLMProvider:
         )
         return any(marker in text for marker in cf_markers)
 
+    @staticmethod
+    def _is_runpod_coldstart(error: openai.APIStatusError) -> bool:
+        """Detect a RunPod pod cool-off / warm-up holding page.
+
+        A cooled/resuming RunPod pod returns an HTML "Waiting for service to
+        respond" holding page instead of a real API response -- and, while the
+        model group is still loading, it can arrive as a 404. This is a
+        transient condition that resolves once the pod finishes warming up, so
+        it must be treated as retryable rather than a fatal NotFoundError.
+
+        Mirrors ``_is_cloudflare_challenge``: signals are (1) the SDK failed to
+        parse the body as JSON (``error.body`` is None), plus (2) a text/html
+        content-type or (3) RunPod holding-page markers in the raw response
+        text. If the SDK parsed a JSON body, this is a real API error
+        regardless of other signals.
+        """
+        # If the SDK parsed a JSON body, this is a real API error (e.g. a
+        # genuine 404 for a truly-absent model) -- never coldstart.
+        if getattr(error, "body", None) is not None:
+            return False
+
+        response = getattr(error, "response", None)
+        if response is None:
+            return False
+
+        content_type = getattr(response, "headers", {}).get("content-type", "").lower()
+        if "text/html" in content_type:
+            return True
+
+        # Fallback: scan response text for RunPod holding-page markers
+        text = (getattr(response, "text", "") or "").lower()
+        runpod_markers = (
+            "waiting for service to respond",
+            "runpod",
+        )
+        return any(marker in text for marker in runpod_markers)
+
     @property
     def is_remote(self) -> bool:
         """True when configured against a non-localhost vLLM endpoint.
@@ -1218,6 +1255,20 @@ class VLLMProvider:
                         error_msg,
                         provider=self.name,
                         status_code=403,
+                    ) from e
+                if self._is_runpod_coldstart(e):
+                    logger.warning(
+                        "[PROVIDER] RunPod cold-start holding page detected "
+                        "(HTTP %s with HTML body). Treating as transient — will "
+                        "retry while the pod warms up.",
+                        status,
+                    )
+                    raise kernel_errors.ProviderUnavailableError(
+                        "RunPod pod warming up (transient holding page). "
+                        "This typically resolves on retry.",
+                        provider=self.name,
+                        status_code=status,
+                        retryable=True,
                     ) from e
                 if status == 404:
                     raise kernel_errors.NotFoundError(
