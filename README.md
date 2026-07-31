@@ -84,7 +84,7 @@ providers:
 
       # Advanced
       enable_state: false                   # Server-side state (requires vLLM config)
-      truncation: "auto"                    # Automatic context management
+      truncation: "disabled"                # Fail loud (HTTP 400) instead of silently dropping input (see below)
       timeout: 300.0                        # API timeout (seconds)
       stream_idle_timeout: 300.0            # Max seconds between streamed chunks (see below)
       priority: 100                         # Provider selection priority
@@ -136,6 +136,39 @@ capped at ~59k tokens even on endpoints that comfortably handle 120k+
 token prompts — causing premature compaction thrashing. `max_output_tokens`
 here is the advertised model maximum used for budgeting, distinct from
 `max_tokens` (the per-request completion cap).
+
+### Truncation
+
+**BEHAVIOR CHANGE**: `truncation` now defaults to `"disabled"` (previously
+`"auto"`). With `truncation: "auto"`, vLLM's Responses API silently drops
+input content that overflows the context window: HTTP 200, no error, no
+warning — the model simply answers from whatever survived. Verified live
+against a direct vLLM endpoint (glm-5.2, real `max_model_len=131072`): a
+~150,000-token prompt with `truncation: "auto"` returned HTTP 200 with
+`usage.input_tokens=131056` (~19,000 tokens silently discarded), while the
+identical prompt with `truncation: "disabled"` returned a clear HTTP 400
+naming the exact limit. OpenAI's own Responses API defaults truncation to
+`"disabled"` for the same reason: a caller that cannot detect data loss
+cannot recover from it.
+
+If your deployment relied on the old auto-truncating behavior (e.g. because
+an upstream context manager doesn't yet cap prompt size to the model's
+context window), opt back in explicitly:
+
+```yaml
+config:
+  truncation: "auto"
+```
+
+Even with `truncation: "auto"` explicitly configured, this provider now
+warns (once per response, via `logger.warning`) whenever the reported
+`usage.input_tokens` lands at or near the resolved context window for that
+model — a signal that the server likely truncated the prompt server-side.
+The warning names the model, the reported `input_tokens`, and the resolved
+context window, but never raises and never alters the response. It reuses
+the same per-model context-window resolution described above (server-reported
+`max_model_len`, clamped by an explicitly configured `context_window`), so it
+stays accurate on endpoints serving multiple models with different limits.
 
 ### Local vs remote — single source of truth
 
