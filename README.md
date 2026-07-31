@@ -115,13 +115,20 @@ prefill while still guaranteeing a hung stream surfaces as a retryable
 error. Non-streaming calls are unaffected (bounded by `timeout`).
 ### Context limits
 
-vLLM does not expose the loaded model's context length via `/v1/models`,
-so the provider advertises defaults (`context_window: 128000`,
-`max_output_tokens: 32768`) to downstream context managers, which derive
-their token budget from these values. If your endpoint serves a model
-with different limits, set `context_window` and `max_output_tokens`
-(config keys above, or the `VLLM_CONTEXT_WINDOW` /
-`VLLM_MAX_OUTPUT_TOKENS` environment variables) to match your deployment.
+vLLM's `/v1/models` model cards expose the loaded model's real context
+length (`max_model_len`), so `context_window` is **auto-discovered per
+model** the first time `list_models()` runs — an endpoint serving several
+models with different limits reports each one accurately instead of a
+single flat number. `max_output_tokens` is never discovered this way
+(vLLM's model cards don't carry it), so it always comes from
+config/defaults.
+
+Leave `context_window` unset to auto-detect from the model, the same way
+`num_ctx: 0` behaves in the Ollama provider. Setting it explicitly (config
+key, or the `VLLM_CONTEXT_WINDOW` environment variable) overrides
+discovery, clamped to the server's reported limit so a stale config value
+can never guarantee a 400. Servers that don't report `max_model_len` fall
+back to the configured value or the `128000` default, exactly as before.
 
 This matters for long-context deployments: with the previous hardcoded
 values (`max_output_tokens: 128000`), the effective input budget was

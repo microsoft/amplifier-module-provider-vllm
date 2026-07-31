@@ -35,10 +35,14 @@ DEFAULT_TRUNCATION = "auto"  # Automatic context management
 # as a retryable error instead of hanging forever.
 DEFAULT_STREAM_IDLE_TIMEOUT = 300.0  # 5 minutes
 
-# Advertised model limits for downstream context managers.
-# vLLM does not expose context length via /v1/models, so these defaults are
-# used unless overridden per provider instance (config keys context_window /
-# max_output_tokens, or VLLM_CONTEXT_WINDOW / VLLM_MAX_OUTPUT_TOKENS env vars).
+# Fallback model limits for downstream context managers.
+# vLLM's /v1/models model cards expose the real context length
+# (max_model_len), so context_window is normally discovered per model at
+# runtime (see VLLMProvider._resolve_limits() in __init__.py). These
+# defaults apply when the server does not report a limit -- e.g. behind a
+# proxy that strips the field -- and are overridden by an explicit
+# context_window / max_output_tokens config key or the
+# VLLM_CONTEXT_WINDOW / VLLM_MAX_OUTPUT_TOKENS env vars.
 # Note: DEFAULT_MAX_OUTPUT_TOKENS is the advertised model maximum (used for
 # token budgeting), NOT the per-request completion cap (DEFAULT_MAX_TOKENS).
 DEFAULT_CONTEXT_WINDOW = 128000
