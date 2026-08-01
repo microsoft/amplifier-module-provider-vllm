@@ -263,6 +263,20 @@ class VLLMProvider:
             or DEFAULT_MAX_OUTPUT_TOKENS
         )
 
+        # Whether the operator EXPLICITLY set context_window (config key or
+        # env var) rather than inheriting the DEFAULT_* fallback above.
+        # _resolve_limits() needs this: an explicit value is a preference to
+        # weigh against the server-reported ceiling, whereas an unset value
+        # means "auto-detect from the model" -- the same semantics as
+        # provider-ollama's num_ctx=0.
+        self._context_window_explicit = bool(
+            self.config.get("context_window") or os.environ.get("VLLM_CONTEXT_WINDOW")
+        )
+
+        # Per-model context windows read from /v1/models model cards
+        # (max_model_len), keyed by model id. See _resolve_limits().
+        self._discovered_limits: dict[str, int] = {}
+
         # Streaming flag — when True (default), emits llm:stream_* contract events
         # via chunked HTTP transport. Set to False to use the blocking create() path
         # (useful for background tasks like session-namer that must NOT stream).
@@ -411,18 +425,20 @@ class VLLMProvider:
                     default=str(DEFAULT_STREAM_IDLE_TIMEOUT),
                     required=False,
                 ),
-                # vLLM does not expose the model's context length via
-                # /v1/models, so these two fields let a deployment override
-                # the advertised limits to match its real endpoint. Downstream
-                # context managers derive their token budget from these values;
-                # leaving them at defaults on a larger endpoint needlessly
-                # caps the usable context.
+                # vLLM's /v1/models model cards expose max_model_len, so
+                # context_window is normally auto-discovered per model (see
+                # _resolve_limits()) and this field acts as an override/cap
+                # rather than the only source of truth. It still matters for
+                # proxies that strip that field, and for max_output_tokens,
+                # which no /v1/models response carries.
                 ConfigField(
                     id="context_window",
                     display_name="Context Window",
                     prompt=(
                         "Context window in tokens advertised to the context "
-                        "manager (vLLM does not expose this via /v1/models)"
+                        "manager (auto-discovered from the server's model "
+                        "card when available; this value acts as an "
+                        "override/cap)"
                     ),
                     field_type="text",
                     env_var="VLLM_CONTEXT_WINDOW",
@@ -435,7 +451,8 @@ class VLLMProvider:
                     prompt=(
                         "Maximum output tokens advertised to the context "
                         "manager (model maximum, not the per-request "
-                        "max_tokens cap; vLLM does not expose this)"
+                        "max_tokens cap; vLLM's model cards do not expose "
+                        "this, so it is never auto-discovered)"
                     ),
                     field_type="text",
                     env_var="VLLM_MAX_OUTPUT_TOKENS",
@@ -450,13 +467,16 @@ class VLLMProvider:
 
         Context managers (e.g. context-simple) prefer ``get_model_info()``
         over ``get_info().defaults`` when computing their token budget, so
-        this must report the same configured (or default) limits.
+        this must report the same resolved limits as list_models(),
+        including any context window discovered by a prior list_models()
+        call (see _resolve_limits()).
         """
+        context_window, max_output_tokens = self._resolve_limits(self.default_model)
         return ModelInfo(
             id=self.default_model,
             display_name=self.default_model,
-            context_window=self.context_window,
-            max_output_tokens=self.max_output_tokens,
+            context_window=context_window,
+            max_output_tokens=max_output_tokens,
             capabilities=[
                 "tools",
                 "streaming",
@@ -473,18 +493,29 @@ class VLLMProvider:
         vLLM serves a single model per instance, so we query
         the models endpoint to get info about the loaded model.
         Raises exception if server is unreachable (no fallback - caller handles errors).
+
+        vLLM's model cards include ``max_model_len`` (the server's real
+        context length); it is cached per model before resolving that
+        model's advertised limits, so an endpoint serving several models
+        with different context lengths reports each one accurately instead
+        of one flat instance-level number. Servers that do not report the
+        field fall back to the configured value or DEFAULT_CONTEXT_WINDOW.
         """
         # vLLM supports OpenAI-compatible /v1/models endpoint
         # Let exceptions propagate - connection errors should be shown to user
         models_response = await self.client.models.list()
         models = []
         for model in models_response.data:
+            discovered = self._extract_max_model_len(model)
+            if discovered is not None:
+                self._discovered_limits[model.id] = discovered
+            context_window, max_output_tokens = self._resolve_limits(model.id)
             models.append(
                 ModelInfo(
                     id=model.id,
                     display_name=model.id,
-                    context_window=self.context_window,  # vLLM doesn't expose this
-                    max_output_tokens=self.max_output_tokens,
+                    context_window=context_window,
+                    max_output_tokens=max_output_tokens,
                     capabilities=[
                         "tools",
                         "streaming",
@@ -525,6 +556,85 @@ class VLLMProvider:
                     retryable=True,
                 ) from e
             yield event
+
+    @staticmethod
+    def _coerce_positive_int(value: Any) -> int | None:
+        """Best-effort coercion to a positive int; None for anything else.
+
+        Model cards are untrusted input: a missing, null, non-numeric, or
+        non-positive ``max_model_len`` must degrade to "not discovered"
+        rather than raise or poison the cache.
+        """
+        try:
+            coerced = int(value)
+        except (TypeError, ValueError):
+            return None
+        return coerced if coerced > 0 else None
+
+    @staticmethod
+    def _extract_max_model_len(card: Any) -> int | None:
+        """Recover a model's real context length from its /v1/models card.
+
+        Direct vLLM's OpenAI-compatible /v1/models endpoint attaches extra
+        fields beyond the OpenAI SDK's ``Model`` schema -- notably
+        ``max_model_len`` -- to each model card. ``openai.types.Model``
+        preserves unknown fields (Pydantic ``extra="allow"``), reachable
+        either as a plain attribute or via ``model_extra`` depending on SDK
+        version, so both are checked. Servers that don't report the field
+        (or proxies that strip it) simply produce a miss -- that means "the
+        server didn't tell us", never an error.
+        """
+        try:
+            value = getattr(card, "max_model_len", None)
+            if value is None:
+                extra = getattr(card, "model_extra", None) or {}
+                value = extra.get("max_model_len")
+        except Exception:
+            return None
+        return VLLMProvider._coerce_positive_int(value)
+
+    def _resolve_limits(self, model_id: str) -> tuple[int, int]:
+        """Resolve the (context_window, max_output_tokens) to advertise for one model.
+
+        An explicitly configured ``context_window`` is a preference; the
+        server-reported ``max_model_len`` is the ceiling of what will
+        actually be accepted. Taking ``min(preference, ceiling)`` keeps a
+        stale config from guaranteeing 400s on a smaller endpoint, while
+        leaving the config unset lets a large endpoint be used to its full
+        discovered limit -- the same "unset means auto-detect" shape as
+        provider-ollama's ``num_ctx``.
+        """
+        ceiling = self._discovered_limits.get(model_id)
+
+        if not self._context_window_explicit:
+            cw = ceiling or self.context_window
+        else:
+            cw = self.context_window
+            if ceiling and cw > ceiling:
+                # The clamp actually bites: surface it rather than silently
+                # capping context_window below what the operator configured
+                # (see amplifier-module-provider-anthropic's equivalent
+                # "Clamping max_tokens" warning).
+                logger.warning(
+                    "[PROVIDER] Clamping context_window from %s to %s for %s",
+                    cw,
+                    ceiling,
+                    model_id,
+                )
+                cw = ceiling
+
+        # Model cards do not carry an output limit, so there is no server
+        # ceiling to clamp against -- only the resolved context window. Cap
+        # output at HALF that window rather than the whole thing: context
+        # managers budget input as roughly
+        # `context_window - max_output_tokens // 2 - safety_margin`, so
+        # advertising an output limit equal to the window leaves no room for
+        # input at all once a small window is discovered (an 8k endpoint
+        # would budget zero usable input tokens). Half leaves headroom while
+        # keeping every configured value at or above a 64k window untouched.
+        mo = min(self.max_output_tokens, max(1, cw // 2))
+
+        return cw, mo
 
     def _build_continuation_input(
         self, original_input: list, accumulated_output: list
