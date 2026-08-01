@@ -52,6 +52,7 @@ from ._cost import compute_cost
 from ._response_handling import convert_response_with_accumulated_output
 from ._token_accounting import apply_token_accounting
 from ._token_accounting import should_apply_token_accounting
+from ._truncation import check_silent_input_truncation
 
 logger = logging.getLogger(__name__)
 
@@ -635,6 +636,47 @@ class VLLMProvider:
         mo = min(self.max_output_tokens, max(1, cw // 2))
 
         return cw, mo
+
+    def _maybe_warn_truncated_input(
+        self,
+        *,
+        model: str,
+        truncation: Any,
+        input_tokens: int | None,
+        requested_max_output_tokens: int | None,
+    ) -> None:
+        """Log once when truncation="auto" likely discarded part of the input.
+
+        truncation="auto" (opt-in only -- the default is "disabled", see
+        DEFAULT_TRUNCATION in _constants.py) lets vLLM silently drop input
+        content that overflows the context window: HTTP 200, no error, no
+        warning. This surfaces that after the fact so operators who chose
+        "auto" still have visibility.
+
+        Resolves the model's context window via the SAME per-model
+        _resolve_limits() path used everywhere else in this provider
+        (server-reported max_model_len, clamped by an explicitly configured
+        context_window) -- no separate ceiling is introduced here. Delegates the
+        actual detection rule (and its evidence-based margin) to
+        check_silent_input_truncation(); this method is just the
+        provider-side wiring: resolve the ceiling, check, log at most once.
+
+        Never raises. Never modifies the response -- this is observability
+        only, called after the returned ChatResponse has already been built.
+        """
+        context_window, _ = self._resolve_limits(model)
+        message = check_silent_input_truncation(
+            truncation=truncation,
+            input_tokens=input_tokens,
+            context_window=context_window,
+            requested_max_output_tokens=requested_max_output_tokens,
+        )
+        if message:
+            logger.warning(
+                "[PROVIDER] Possible silent input truncation for model %s: %s",
+                model,
+                message,
+            )
 
     def _build_continuation_input(
         self, original_input: list, accumulated_output: list
@@ -1621,6 +1663,23 @@ class VLLMProvider:
             else:
                 # Use existing conversion for normal (non-continued) responses
                 chat_response = self._convert_to_chat_response(response)
+
+            # Surface silent input truncation (truncation="auto" only -- the
+            # default is "disabled", which fails loud instead). Reuses the
+            # SAME canonical chat_response.usage.input_tokens the llm:response
+            # event below reports -- no separate/parallel usage parsing. Runs
+            # exactly once here regardless of how many continuation rounds
+            # preceded this point, so at most one warning is logged per
+            # response. See _truncation.py for the detection rule and its
+            # evidence-based margin.
+            self._maybe_warn_truncated_input(
+                model=params["model"],
+                truncation=params.get("truncation"),
+                input_tokens=(
+                    chat_response.usage.input_tokens if chat_response.usage else None
+                ),
+                requested_max_output_tokens=params.get("max_output_tokens"),
+            )
 
             # Emit llm:response event using canonical usage fields from chat_response
             if self.coordinator and hasattr(self.coordinator, "hooks"):
