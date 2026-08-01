@@ -19,6 +19,7 @@ of them.
 """
 
 import logging
+from openai.types import Model
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -50,6 +51,65 @@ def _mock_client(*cards: SimpleNamespace) -> MagicMock:
 # ---------------------------------------------------------------------------
 # 1, 2, 3, 4, 5, 9: list_models() discovery, precedence, and clamping
 # ---------------------------------------------------------------------------
+
+
+class TestRealSDKModelObject:
+    """Discovery must survive the REAL openai.types.Model, not just a stub.
+
+    Every other test here builds cards as SimpleNamespace, where getattr
+    trivially succeeds for any kwarg. That proves nothing about the object
+    the SDK actually hands us: openai.types.Model declares a fixed schema,
+    and max_model_len is a vLLM vendor extension outside it. If the SDK ever
+    stopped preserving unknown fields, discovery would silently never fire
+    and every SimpleNamespace-based test here would still pass. This pins
+    the premise against the real type.
+
+    vLLM has declared max_model_len on ModelCard continuously (verified on
+    v0.6.0, v0.9.0, v0.11.0), so the server side of the contract is stable;
+    this guards the client side.
+    """
+
+    # Realistic direct-vLLM /v1/models card, vendor fields included.
+    RAW = {
+        "id": "zai-org/GLM-4.6",
+        "object": "model",
+        "created": 1753900000,
+        "owned_by": "vllm",
+        "root": "zai-org/GLM-4.6",
+        "parent": None,
+        "max_model_len": 131072,
+    }
+
+    def test_construct_path_preserves_max_model_len(self):
+        """The SDK builds responses via construct() -- extras must survive it."""
+        card = Model.construct(**self.RAW)
+        assert VLLMProvider._extract_max_model_len(card) == 131072
+
+    def test_validate_path_preserves_max_model_len(self):
+        """Strict validation must preserve extras too (pydantic extra="allow")."""
+        card = Model.model_validate(self.RAW)
+        assert VLLMProvider._extract_max_model_len(card) == 131072
+
+    def test_card_without_max_model_len_is_a_miss_not_an_error(self):
+        """A proxy that strips vendor fields degrades to "not discovered"."""
+        raw = {k: v for k, v in self.RAW.items() if k != "max_model_len"}
+        assert VLLMProvider._extract_max_model_len(Model.construct(**raw)) is None
+
+    @pytest.mark.parametrize(
+        "value,expected",
+        [
+            ("131072", 131072),
+            (131072.9, 131072),
+            (0, None),
+            (-5, None),
+            (None, None),
+            ("abc", None),
+        ],
+    )
+    def test_malformed_values_never_raise(self, value, expected):
+        """Non-positive/garbage max_model_len means "unknown", never an exception."""
+        card = Model.construct(**{**self.RAW, "max_model_len": value})
+        assert VLLMProvider._extract_max_model_len(card) == expected
 
 
 class TestListModelsDiscovery:
