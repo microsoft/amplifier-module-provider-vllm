@@ -426,11 +426,12 @@ class VLLMProvider:
                     default=str(DEFAULT_STREAM_IDLE_TIMEOUT),
                     required=False,
                 ),
-                # vLLM's /v1/models model cards expose max_model_len, so
+                # vLLM's /v1/models model cards expose max_model_len (and
+                # LiteLLM-style proxies expose max_input_tokens instead), so
                 # context_window is normally auto-discovered per model (see
                 # _resolve_limits()) and this field acts as an override/cap
                 # rather than the only source of truth. It still matters for
-                # proxies that strip that field, and for max_output_tokens,
+                # proxies that strip both fields, and for max_output_tokens,
                 # which no /v1/models response carries.
                 ConfigField(
                     id="context_window",
@@ -496,11 +497,13 @@ class VLLMProvider:
         Raises exception if server is unreachable (no fallback - caller handles errors).
 
         vLLM's model cards include ``max_model_len`` (the server's real
-        context length); it is cached per model before resolving that
-        model's advertised limits, so an endpoint serving several models
-        with different context lengths reports each one accurately instead
-        of one flat instance-level number. Servers that do not report the
-        field fall back to the configured value or DEFAULT_CONTEXT_WINDOW.
+        context length); OpenAI-compatible proxies that strip it may report
+        ``max_input_tokens`` instead, which discovery falls back to. The
+        discovered value is cached per model before resolving that model's
+        advertised limits, so an endpoint serving several models with
+        different context lengths reports each one accurately instead of
+        one flat instance-level number. Servers that report neither field
+        fall back to the configured value or DEFAULT_CONTEXT_WINDOW.
         """
         # vLLM supports OpenAI-compatible /v1/models endpoint
         # Let exceptions propagate - connection errors should be shown to user
@@ -581,15 +584,26 @@ class VLLMProvider:
         ``max_model_len`` -- to each model card. ``openai.types.Model``
         preserves unknown fields (Pydantic ``extra="allow"``), reachable
         either as a plain attribute or via ``model_extra`` depending on SDK
-        version, so both are checked. Servers that don't report the field
-        (or proxies that strip it) simply produce a miss -- that means "the
-        server didn't tell us", never an error.
+        version, so both are checked.
+
+        OpenAI-compatible proxies/gateways in front of vLLM (LiteLLM-style,
+        e.g. RunPod endpoints) strip ``max_model_len`` and instead report
+        ``max_input_tokens`` / ``max_output_tokens`` on the card, so when
+        ``max_model_len`` is absent entirely, ``max_input_tokens`` is probed
+        the same way as a fallback. Servers that report neither field
+        simply produce a miss -- that means "the server didn't tell us",
+        never an error.
         """
         try:
             value = getattr(card, "max_model_len", None)
             if value is None:
                 extra = getattr(card, "model_extra", None) or {}
                 value = extra.get("max_model_len")
+            if value is None:
+                value = getattr(card, "max_input_tokens", None)
+            if value is None:
+                extra = getattr(card, "model_extra", None) or {}
+                value = extra.get("max_input_tokens")
         except Exception:
             return None
         return VLLMProvider._coerce_positive_int(value)

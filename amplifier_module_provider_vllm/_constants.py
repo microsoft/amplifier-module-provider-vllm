@@ -72,10 +72,11 @@ DEFAULT_STREAM_IDLE_TIMEOUT = 300.0  # 5 minutes
 
 # Fallback model limits for downstream context managers.
 # vLLM's /v1/models model cards expose the real context length
-# (max_model_len), so context_window is normally discovered per model at
-# runtime (see VLLMProvider._resolve_limits() in __init__.py). These
-# defaults apply when the server does not report a limit -- e.g. behind a
-# proxy that strips the field -- and are overridden by an explicit
+# (max_model_len; LiteLLM-style proxies strip it but report
+# max_input_tokens, which discovery falls back to), so context_window is
+# normally discovered per model at runtime (see
+# VLLMProvider._resolve_limits() in __init__.py). These defaults apply
+# when the server reports neither field and are overridden by an explicit
 # context_window / max_output_tokens config key or the
 # VLLM_CONTEXT_WINDOW / VLLM_MAX_OUTPUT_TOKENS env vars.
 # Note: DEFAULT_MAX_OUTPUT_TOKENS is the advertised model maximum (used for
