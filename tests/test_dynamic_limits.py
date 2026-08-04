@@ -112,6 +112,82 @@ class TestRealSDKModelObject:
         assert VLLMProvider._extract_max_model_len(card) == expected
 
 
+class TestProxyMaxInputTokensFallback:
+    """Proxies (LiteLLM-style, e.g. RunPod) strip max_model_len and report
+    max_input_tokens / max_output_tokens instead; discovery must fall back
+    to max_input_tokens rather than silently defaulting to
+    DEFAULT_CONTEXT_WINDOW (observed: Qwen3-Coder-30B's real 262144 window
+    halved to 128000 behind such a proxy)."""
+
+    # Realistic proxied /v1/models card: no max_model_len, proxy limit
+    # fields instead.
+    RAW = {
+        "id": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+        "object": "model",
+        "created": 1753900000,
+        "owned_by": "vllm",
+        "max_input_tokens": 262144,
+        "max_output_tokens": 262144,
+    }
+
+    def test_construct_path_falls_back_to_max_input_tokens(self):
+        card = Model.construct(**self.RAW)
+        assert VLLMProvider._extract_max_model_len(card) == 262144
+
+    def test_validate_path_falls_back_to_max_input_tokens(self):
+        card = Model.model_validate(self.RAW)
+        assert VLLMProvider._extract_max_model_len(card) == 262144
+
+    def test_max_model_len_wins_over_max_input_tokens(self):
+        """When both are present, the server's own max_model_len is
+        authoritative; the proxy field is only a fallback."""
+        card = Model.construct(**{**self.RAW, "max_model_len": 131072})
+        assert VLLMProvider._extract_max_model_len(card) == 131072
+
+    def test_plain_attribute_fallback(self):
+        """SimpleNamespace path: attribute probe without model_extra."""
+        card = SimpleNamespace(id="glm-5.2", max_input_tokens=131072)
+        assert VLLMProvider._extract_max_model_len(card) == 131072
+
+    def test_model_extra_fallback(self):
+        """model_extra path: SDK versions exposing extras only via dict."""
+        card = SimpleNamespace(id="glm-5.2", model_extra={"max_input_tokens": 131072})
+        assert VLLMProvider._extract_max_model_len(card) == 131072
+
+    @pytest.mark.parametrize(
+        "value,expected",
+        [
+            ("262144", 262144),
+            (0, None),
+            (-5, None),
+            (None, None),
+            ("abc", None),
+        ],
+    )
+    def test_malformed_max_input_tokens_never_raise(self, value, expected):
+        """The fallback field goes through the same coercion/positivity
+        validation as max_model_len: garbage means "unknown", never an
+        exception."""
+        card = Model.construct(**{**self.RAW, "max_input_tokens": value})
+        assert VLLMProvider._extract_max_model_len(card) == expected
+
+    @pytest.mark.asyncio
+    async def test_list_models_discovers_via_max_input_tokens(self):
+        """End-to-end: a proxied card with only max_input_tokens must not
+        fall back to DEFAULT_CONTEXT_WINDOW."""
+        provider = VLLMProvider(
+            client=_mock_client(
+                _model_card("qwen3-coder-30b", max_input_tokens=262144)
+            ),
+            config={},
+        )
+        models = await provider.list_models()
+
+        assert len(models) == 1
+        assert models[0].context_window == 262144
+        assert models[0].context_window != DEFAULT_CONTEXT_WINDOW
+
+
 class TestListModelsDiscovery:
     """list_models() feeds each card's max_model_len into discovery and
     resolves per-model limits instead of stamping the instance-level flat

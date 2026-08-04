@@ -275,8 +275,14 @@ class VLLMProvider:
         )
 
         # Per-model context windows read from /v1/models model cards
-        # (max_model_len), keyed by model id. See _resolve_limits().
+        # (max_model_len, or max_input_tokens behind a proxy that strips
+        # it), keyed by model id. See _resolve_limits().
         self._discovered_limits: dict[str, int] = {}
+
+        # Per-model output ceilings, keyed by model id. Direct vLLM cards
+        # carry no output limit; LiteLLM-style proxies report one as
+        # max_output_tokens. Only ever tightens the resolved value.
+        self._discovered_output_limits: dict[str, int] = {}
 
         # Streaming flag — when True (default), emits llm:stream_* contract events
         # via chunked HTTP transport. Set to False to use the blocking create() path
@@ -507,9 +513,22 @@ class VLLMProvider:
         models_response = await self.client.models.list()
         models = []
         for model in models_response.data:
-            discovered = self._extract_max_model_len(model)
+            discovered, discovered_out, source = self._discover_card_limits(model)
             if discovered is not None:
+                # Name the field the number came from. The bug this
+                # discovery path exists to fix was a *silent* fallback to
+                # DEFAULT_CONTEXT_WINDOW; an unlabelled number from a proxy
+                # would be the same failure one layer up.
+                if self._discovered_limits.get(model.id) != discovered:
+                    logger.info(
+                        "[PROVIDER] Discovered context_window=%s for %s via %s",
+                        discovered,
+                        model.id,
+                        source,
+                    )
                 self._discovered_limits[model.id] = discovered
+            if discovered_out is not None:
+                self._discovered_output_limits[model.id] = discovered_out
             context_window, max_output_tokens = self._resolve_limits(model.id)
             models.append(
                 ModelInfo(
@@ -573,26 +592,62 @@ class VLLMProvider:
         return coerced if coerced > 0 else None
 
     @staticmethod
-    def _extract_max_model_len(card: Any) -> int | None:
-        """Recover a model's real context length from its /v1/models card.
+    def _extract_card_int(card: Any, field: str) -> int | None:
+        """Probe one extra field off a /v1/models model card.
 
-        Direct vLLM's OpenAI-compatible /v1/models endpoint attaches extra
-        fields beyond the OpenAI SDK's ``Model`` schema -- notably
-        ``max_model_len`` -- to each model card. ``openai.types.Model``
-        preserves unknown fields (Pydantic ``extra="allow"``), reachable
-        either as a plain attribute or via ``model_extra`` depending on SDK
-        version, so both are checked. Servers that don't report the field
-        (or proxies that strip it) simply produce a miss -- that means "the
-        server didn't tell us", never an error.
+        ``openai.types.Model`` preserves unknown fields (Pydantic
+        ``extra="allow"``), reachable either as a plain attribute or via
+        ``model_extra`` depending on SDK version, so both are checked. A
+        missing field is a miss -- that means "the server didn't tell us",
+        never an error.
         """
         try:
-            value = getattr(card, "max_model_len", None)
+            value = getattr(card, field, None)
             if value is None:
                 extra = getattr(card, "model_extra", None) or {}
-                value = extra.get("max_model_len")
+                value = extra.get(field)
         except Exception:
             return None
         return VLLMProvider._coerce_positive_int(value)
+
+    @staticmethod
+    def _discover_card_limits(card: Any) -> tuple[int | None, int | None, str | None]:
+        """Recover a model's real limits from its /v1/models card.
+
+        Returns ``(context_window, max_output_tokens, source)`` where
+        ``source`` names which field the context window came from, so the
+        discovery path is visible in logs rather than being an unmarked
+        number. ``None`` for a limit means "not discovered".
+
+        Direct vLLM reports the server's real total context length as
+        ``max_model_len`` and carries no output limit. OpenAI-compatible
+        proxies/gateways in front of vLLM (LiteLLM-style, e.g. RunPod
+        endpoints) strip ``max_model_len`` and instead report
+        ``max_input_tokens`` / ``max_output_tokens``, so those are probed as
+        a fallback. ``max_model_len`` wins whenever it is present.
+
+        Note the vocabularies differ: ``max_model_len`` is total context
+        (input + output) while ``max_input_tokens`` is input-only. Treating
+        the latter as a total is deliberately conservative -- it can only
+        under-report real capacity, never over-commit it.
+        """
+        context = VLLMProvider._extract_card_int(card, "max_model_len")
+        source = "max_model_len" if context is not None else None
+        if context is None:
+            context = VLLMProvider._extract_card_int(card, "max_input_tokens")
+            source = "max_input_tokens" if context is not None else None
+        output = VLLMProvider._extract_card_int(card, "max_output_tokens")
+        return context, output, source
+
+    @staticmethod
+    def _extract_max_model_len(card: Any) -> int | None:
+        """Context window discovered from a model card, or None on a miss.
+
+        Thin accessor over :meth:`_discover_card_limits` for callers that
+        only need the context window.
+        """
+        context, _output, _source = VLLMProvider._discover_card_limits(card)
+        return context
 
     def _resolve_limits(self, model_id: str) -> tuple[int, int]:
         """Resolve the (context_window, max_output_tokens) to advertise for one model.
@@ -624,16 +679,30 @@ class VLLMProvider:
                 )
                 cw = ceiling
 
-        # Model cards do not carry an output limit, so there is no server
-        # ceiling to clamp against -- only the resolved context window. Cap
-        # output at HALF that window rather than the whole thing: context
-        # managers budget input as roughly
-        # `context_window - max_output_tokens // 2 - safety_margin`, so
-        # advertising an output limit equal to the window leaves no room for
-        # input at all once a small window is discovered (an 8k endpoint
-        # would budget zero usable input tokens). Half leaves headroom while
-        # keeping every configured value at or above a 64k window untouched.
+        # Direct vLLM model cards carry no output limit, so the only
+        # ceiling is the resolved context window. Cap output at HALF that
+        # window rather than the whole thing: context managers budget input
+        # as roughly `context_window - max_output_tokens // 2 -
+        # safety_margin`, so advertising an output limit equal to the window
+        # leaves no room for input at all once a small window is discovered
+        # (an 8k endpoint would budget zero usable input tokens). Half
+        # leaves headroom while keeping every configured value at or above a
+        # 64k window untouched.
         mo = min(self.max_output_tokens, max(1, cw // 2))
+
+        # A proxy that reports max_output_tokens gives a real server ceiling
+        # the half-window heuristic can't know about. Apply it as an
+        # additional clamp only -- it can tighten the advertised limit but
+        # never raise it above the headroom guard above.
+        out_ceiling = self._discovered_output_limits.get(model_id)
+        if out_ceiling is not None and out_ceiling < mo:
+            logger.info(
+                "[PROVIDER] Clamping max_output_tokens from %s to server-reported %s for %s",
+                mo,
+                out_ceiling,
+                model_id,
+            )
+            mo = out_ceiling
 
         return cw, mo
 
@@ -1180,7 +1249,9 @@ class VLLMProvider:
 
                                         if et == "response.output_item.added":
                                             idx = event.output_index + offset
-                                            item_type = getattr(event.item, "type", None)
+                                            item_type = getattr(
+                                                event.item, "type", None
+                                            )
                                             block_type = {
                                                 "message": "text",
                                                 "reasoning": "thinking",
@@ -1210,7 +1281,9 @@ class VLLMProvider:
                                                     {
                                                         "request_id": request_id,
                                                         "block_index": idx,
-                                                        "block_type": block_types_local.get(idx, "text"),
+                                                        "block_type": block_types_local.get(
+                                                            idx, "text"
+                                                        ),
                                                         "sequence": seq.get(idx, 0),
                                                         "text": text,
                                                     },
@@ -1246,7 +1319,9 @@ class VLLMProvider:
                                                     {
                                                         "request_id": request_id,
                                                         "block_index": idx,
-                                                        "block_type": block_types_local[idx],
+                                                        "block_type": block_types_local[
+                                                            idx
+                                                        ],
                                                     },
                                                 )
 
@@ -1259,7 +1334,9 @@ class VLLMProvider:
                         _stream_state["block_types"] = block_types_local
                         # Advance offset: next round blocks start above current max
                         if block_types_local:
-                            _stream_state["block_index_offset"] = max(block_types_local.keys()) + 1
+                            _stream_state["block_index_offset"] = (
+                                max(block_types_local.keys()) + 1
+                            )
                         else:
                             _stream_state.setdefault("block_index_offset", 0)
 
@@ -1526,14 +1603,18 @@ class VLLMProvider:
                         # Reuses request_id from _stream_state (same logical call).
                         # block_index_offset advances so renderer sees one sequence.
                         # -------------------------------------------------------
-                        cont_request_id = _stream_state.get("request_id", str(uuid.uuid4()))
+                        cont_request_id = _stream_state.get(
+                            "request_id", str(uuid.uuid4())
+                        )
                         cont_seq = _stream_state.get("seq", {})
                         cont_block_types = _stream_state.get("block_types", {})
                         cont_offset = _stream_state.get("block_index_offset", 0)
                         cont_partial = _stream_state.get("partial_emitted", False)
 
                         async with asyncio.timeout(self.timeout):
-                            async with self.client.responses.stream(**continue_params) as cont_stream:
+                            async with self.client.responses.stream(
+                                **continue_params
+                            ) as cont_stream:
                                 async for event in self._iter_with_idle_timeout(
                                     cont_stream
                                 ):
@@ -1542,7 +1623,9 @@ class VLLMProvider:
 
                                         if et == "response.output_item.added":
                                             idx = event.output_index + cont_offset
-                                            item_type = getattr(event.item, "type", None)
+                                            item_type = getattr(
+                                                event.item, "type", None
+                                            )
                                             block_type = {
                                                 "message": "text",
                                                 "reasoning": "thinking",
@@ -1556,7 +1639,9 @@ class VLLMProvider:
                                                 "block_type": block_type,
                                             }
                                             if block_type == "tool_use":
-                                                cont_name = getattr(event.item, "name", None)
+                                                cont_name = getattr(
+                                                    event.item, "name", None
+                                                )
                                                 if cont_name:
                                                     cont_payload["name"] = cont_name
                                             await self.coordinator.hooks.emit(
@@ -1572,8 +1657,12 @@ class VLLMProvider:
                                                     {
                                                         "request_id": cont_request_id,
                                                         "block_index": idx,
-                                                        "block_type": cont_block_types.get(idx, "text"),
-                                                        "sequence": cont_seq.get(idx, 0),
+                                                        "block_type": cont_block_types.get(
+                                                            idx, "text"
+                                                        ),
+                                                        "sequence": cont_seq.get(
+                                                            idx, 0
+                                                        ),
                                                         "text": text,
                                                     },
                                                 )
@@ -1593,7 +1682,9 @@ class VLLMProvider:
                                                         "request_id": cont_request_id,
                                                         "block_index": idx,
                                                         "block_type": "thinking",
-                                                        "sequence": cont_seq.get(idx, 0),
+                                                        "sequence": cont_seq.get(
+                                                            idx, 0
+                                                        ),
                                                         "text": text,
                                                     },
                                                 )
@@ -1608,7 +1699,9 @@ class VLLMProvider:
                                                     {
                                                         "request_id": cont_request_id,
                                                         "block_index": idx,
-                                                        "block_type": cont_block_types[idx],
+                                                        "block_type": cont_block_types[
+                                                            idx
+                                                        ],
                                                     },
                                                 )
 
@@ -1617,7 +1710,9 @@ class VLLMProvider:
                         # Update shared streaming state for next continuation round
                         _stream_state["partial_emitted"] = cont_partial
                         if cont_block_types:
-                            _stream_state["block_index_offset"] = max(cont_block_types.keys()) + 1
+                            _stream_state["block_index_offset"] = (
+                                max(cont_block_types.keys()) + 1
+                            )
                     else:
                         # Non-streaming continuation fallback
                         final_response = await asyncio.wait_for(
