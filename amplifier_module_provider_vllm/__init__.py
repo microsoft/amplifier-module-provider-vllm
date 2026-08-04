@@ -44,6 +44,8 @@ from ._constants import DEFAULT_REASONING_SUMMARY
 from ._constants import DEFAULT_STREAM_IDLE_TIMEOUT
 from ._constants import DEFAULT_TIMEOUT
 from ._constants import DEFAULT_TRUNCATION
+from ._constants import GATEWAY_WARMUP_MARKERS
+from ._constants import GATEWAY_WARMUP_STATUS_CODES
 from ._constants import MAX_CONTINUATION_ATTEMPTS
 from ._constants import METADATA_INCOMPLETE_REASON
 from ._constants import METADATA_RESPONSE_ID
@@ -350,6 +352,48 @@ class VLLMProvider:
             "checking if the site connection is secure",
         )
         return any(marker in text for marker in cf_markers)
+
+    @staticmethod
+    def _is_gateway_warmup_page(error: openai.APIStatusError) -> bool:
+        """Detect a hosted front door serving a holding page while it warms up.
+
+        A vLLM server behind a hosted-GPU gateway can answer with an HTML
+        "waiting for service to respond" page instead of the API while the
+        backend is still starting -- and, while the model group is loading,
+        that page can arrive as a 404. That is transient and resolves once
+        the backend is up, so it must not be reported as a permanently
+        missing model.
+
+        Three conditions, ALL required:
+
+        1. The SDK failed to parse the body as JSON (``error.body`` is None).
+           A parsed JSON body is a real API error, always.
+        2. The status is one whose default classification would otherwise be
+           permanently fatal (``GATEWAY_WARMUP_STATUS_CODES``). 5xx is
+           already retryable and needs no help; 400/401/403/413 are real,
+           operator-fixable errors that must keep their own diagnostics.
+        3. The body carries an explicit warm-up phrase
+           (``GATEWAY_WARMUP_MARKERS``).
+
+        Condition 3 is what keeps this honest. Treating "the body is HTML"
+        as sufficient -- the way ``_is_cloudflare_challenge`` can, because it
+        is scoped to 403 -- would swallow every permanent HTML error page a
+        proxy emits: a typo'd model name returns a 404 page too, and would
+        then be retried for a minute and reported as a warm-up, sending the
+        operator after a fix that will never work.
+        """
+        if getattr(error, "body", None) is not None:
+            return False
+
+        if getattr(error, "status_code", None) not in GATEWAY_WARMUP_STATUS_CODES:
+            return False
+
+        response = getattr(error, "response", None)
+        if response is None:
+            return False
+
+        text = (getattr(response, "text", "") or "").lower()
+        return any(marker in text for marker in GATEWAY_WARMUP_MARKERS)
 
     @property
     def is_remote(self) -> bool:
@@ -1180,7 +1224,9 @@ class VLLMProvider:
 
                                         if et == "response.output_item.added":
                                             idx = event.output_index + offset
-                                            item_type = getattr(event.item, "type", None)
+                                            item_type = getattr(
+                                                event.item, "type", None
+                                            )
                                             block_type = {
                                                 "message": "text",
                                                 "reasoning": "thinking",
@@ -1210,7 +1256,9 @@ class VLLMProvider:
                                                     {
                                                         "request_id": request_id,
                                                         "block_index": idx,
-                                                        "block_type": block_types_local.get(idx, "text"),
+                                                        "block_type": block_types_local.get(
+                                                            idx, "text"
+                                                        ),
                                                         "sequence": seq.get(idx, 0),
                                                         "text": text,
                                                     },
@@ -1246,7 +1294,9 @@ class VLLMProvider:
                                                     {
                                                         "request_id": request_id,
                                                         "block_index": idx,
-                                                        "block_type": block_types_local[idx],
+                                                        "block_type": block_types_local[
+                                                            idx
+                                                        ],
                                                     },
                                                 )
 
@@ -1259,7 +1309,9 @@ class VLLMProvider:
                         _stream_state["block_types"] = block_types_local
                         # Advance offset: next round blocks start above current max
                         if block_types_local:
-                            _stream_state["block_index_offset"] = max(block_types_local.keys()) + 1
+                            _stream_state["block_index_offset"] = (
+                                max(block_types_local.keys()) + 1
+                            )
                         else:
                             _stream_state.setdefault("block_index_offset", 0)
 
@@ -1370,6 +1422,21 @@ class VLLMProvider:
                         error_msg,
                         provider=self.name,
                         status_code=403,
+                    ) from e
+                if self._is_gateway_warmup_page(e):
+                    logger.warning(
+                        "[PROVIDER] Gateway warm-up holding page detected "
+                        "(HTTP %s, non-JSON body carrying a warm-up notice). "
+                        "Treating as transient — will retry while the backend "
+                        "finishes starting.",
+                        status,
+                    )
+                    raise kernel_errors.ProviderUnavailableError(
+                        "Endpoint gateway is still starting the backend "
+                        "(transient holding page). This typically resolves on retry.",
+                        provider=self.name,
+                        status_code=status,
+                        retryable=True,
                     ) from e
                 if status == 404:
                     raise kernel_errors.NotFoundError(
@@ -1526,14 +1593,18 @@ class VLLMProvider:
                         # Reuses request_id from _stream_state (same logical call).
                         # block_index_offset advances so renderer sees one sequence.
                         # -------------------------------------------------------
-                        cont_request_id = _stream_state.get("request_id", str(uuid.uuid4()))
+                        cont_request_id = _stream_state.get(
+                            "request_id", str(uuid.uuid4())
+                        )
                         cont_seq = _stream_state.get("seq", {})
                         cont_block_types = _stream_state.get("block_types", {})
                         cont_offset = _stream_state.get("block_index_offset", 0)
                         cont_partial = _stream_state.get("partial_emitted", False)
 
                         async with asyncio.timeout(self.timeout):
-                            async with self.client.responses.stream(**continue_params) as cont_stream:
+                            async with self.client.responses.stream(
+                                **continue_params
+                            ) as cont_stream:
                                 async for event in self._iter_with_idle_timeout(
                                     cont_stream
                                 ):
@@ -1542,7 +1613,9 @@ class VLLMProvider:
 
                                         if et == "response.output_item.added":
                                             idx = event.output_index + cont_offset
-                                            item_type = getattr(event.item, "type", None)
+                                            item_type = getattr(
+                                                event.item, "type", None
+                                            )
                                             block_type = {
                                                 "message": "text",
                                                 "reasoning": "thinking",
@@ -1556,7 +1629,9 @@ class VLLMProvider:
                                                 "block_type": block_type,
                                             }
                                             if block_type == "tool_use":
-                                                cont_name = getattr(event.item, "name", None)
+                                                cont_name = getattr(
+                                                    event.item, "name", None
+                                                )
                                                 if cont_name:
                                                     cont_payload["name"] = cont_name
                                             await self.coordinator.hooks.emit(
@@ -1572,8 +1647,12 @@ class VLLMProvider:
                                                     {
                                                         "request_id": cont_request_id,
                                                         "block_index": idx,
-                                                        "block_type": cont_block_types.get(idx, "text"),
-                                                        "sequence": cont_seq.get(idx, 0),
+                                                        "block_type": cont_block_types.get(
+                                                            idx, "text"
+                                                        ),
+                                                        "sequence": cont_seq.get(
+                                                            idx, 0
+                                                        ),
                                                         "text": text,
                                                     },
                                                 )
@@ -1593,7 +1672,9 @@ class VLLMProvider:
                                                         "request_id": cont_request_id,
                                                         "block_index": idx,
                                                         "block_type": "thinking",
-                                                        "sequence": cont_seq.get(idx, 0),
+                                                        "sequence": cont_seq.get(
+                                                            idx, 0
+                                                        ),
                                                         "text": text,
                                                     },
                                                 )
@@ -1608,7 +1689,9 @@ class VLLMProvider:
                                                     {
                                                         "request_id": cont_request_id,
                                                         "block_index": idx,
-                                                        "block_type": cont_block_types[idx],
+                                                        "block_type": cont_block_types[
+                                                            idx
+                                                        ],
                                                     },
                                                 )
 
@@ -1617,7 +1700,9 @@ class VLLMProvider:
                         # Update shared streaming state for next continuation round
                         _stream_state["partial_emitted"] = cont_partial
                         if cont_block_types:
-                            _stream_state["block_index_offset"] = max(cont_block_types.keys()) + 1
+                            _stream_state["block_index_offset"] = (
+                                max(cont_block_types.keys()) + 1
+                            )
                     else:
                         # Non-streaming continuation fallback
                         final_response = await asyncio.wait_for(

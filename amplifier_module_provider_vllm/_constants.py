@@ -86,3 +86,34 @@ DEFAULT_MAX_OUTPUT_TOKENS = 32768
 # Maximum number of continuation attempts for incomplete responses
 # This prevents infinite loops while being generous enough for legitimate large responses
 MAX_CONTINUATION_ATTEMPTS = 5
+
+# Gateway warm-up holding pages.
+#
+# A vLLM server behind a hosted-GPU front door (RunPod, Modal, Anyscale,
+# Lambda Labs, or any nginx/traefik/envoy reverse proxy) can answer with an
+# HTML holding page instead of the API while the backend is still starting.
+# That is transient and resolves on retry -- but only for statuses whose
+# default classification would otherwise be permanently fatal.
+#
+# 404 is the case actually observed in the wild: the model group is not yet
+# registered, so the gateway reports "not found" for a model that is about
+# to exist. 425 Too Early is the same condition stated explicitly. Every
+# other status keeps its normal handling -- 5xx is already retryable, and
+# 400/401/403/413 are real, operator-fixable errors that must stay fatal
+# and keep their own diagnostics.
+GATEWAY_WARMUP_STATUS_CODES = frozenset({404, 425})
+
+# A positive warm-up phrase is REQUIRED. Matching on "the body is HTML"
+# alone would swallow every permanent HTML error page a proxy emits -- a
+# typo'd model name returning a 404 page would be retried and then reported
+# as a warm-up, sending the operator after the wrong fix. Vendor names are
+# deliberately excluded: the failure is a property of hosted front doors in
+# general, not of one provider (cf. DEFAULT_STREAM_IDLE_TIMEOUT above, which
+# handles the same class of proxy misbehaviour without naming anyone).
+GATEWAY_WARMUP_MARKERS = (
+    "waiting for service to respond",
+    "service is starting",
+    "starting up",
+    "warming up",
+    "initializing",
+)
