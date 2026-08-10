@@ -1507,6 +1507,21 @@ class VLLMProvider:
                         status_code=status,
                         retryable=True,
                     ) from e
+                if status == 408:
+                    if "time taken=0.0" in error_msg:
+                        raise kernel_errors.LLMTimeoutError(
+                            "Gateway reported an instant timeout (408 with "
+                            "'time taken=0.0'): the request never reached the "
+                            "backend. Retrying.",
+                            provider=self.name,
+                            retryable=True,
+                        ) from e
+                    raise kernel_errors.LLMError(
+                        error_msg,
+                        provider=self.name,
+                        status_code=status,
+                        retryable=False,
+                    ) from e
                 if status == 404:
                     raise kernel_errors.NotFoundError(
                         error_msg,
