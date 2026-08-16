@@ -328,7 +328,9 @@ class VLLMProvider:
         Cloudflare interposes HTML challenge pages (HTTP 403) that look nothing
         like real API errors.  Signals:
 
-        1. The SDK failed to parse the body as JSON (error.body is None).
+        1. The body did not parse as a JSON object/array. (When the SDK
+           cannot parse the body as JSON it stores the RAW TEXT in
+           ``error.body`` -- a str, NOT None; a parsed error is a dict/list.)
         2. The Content-Type is text/html (not application/json).
         3. The raw response text contains Cloudflare markers.
 
@@ -336,8 +338,14 @@ class VLLMProvider:
         successfully parsed a JSON body, this is a real API error regardless
         of other signals.
         """
-        # If the SDK parsed a JSON body, this is a real API error
-        if getattr(error, "body", None) is not None:
+        # Only a PARSED JSON body (dict/list) means a genuine, structured
+        # API error. When the SDK cannot parse the body as JSON it stores the
+        # RAW TEXT in ``error.body`` -- a str, NOT None -- so a "body is not
+        # None" guard bails on exactly the HTML challenge pages this exists to
+        # catch. Fall through for a str (or absent) body; bail only on parsed
+        # JSON.
+        body = getattr(error, "body", None)
+        if isinstance(body, (dict, list)):
             return False
 
         # Inspect the raw HTTP response for HTML / Cloudflare signals
@@ -372,8 +380,9 @@ class VLLMProvider:
 
         Three conditions, ALL required:
 
-        1. The SDK failed to parse the body as JSON (``error.body`` is None).
-           A parsed JSON body is a real API error, always.
+        1. The body did not parse as a JSON object/array. (The SDK stores an
+           unparsed body as the raw text str in ``error.body`` -- never None;
+           a parsed JSON object/array is a real API error, always.)
         2. The status is one whose default classification would otherwise be
            permanently fatal (``GATEWAY_WARMUP_STATUS_CODES``). 5xx is
            already retryable and needs no help; 400/401/403/413 are real,
@@ -388,7 +397,11 @@ class VLLMProvider:
         then be retried for a minute and reported as a warm-up, sending the
         operator after a fix that will never work.
         """
-        if getattr(error, "body", None) is not None:
+        # Only a parsed JSON body (dict/list) is a genuine API error. An
+        # unparsed HTML holding page arrives as a str in error.body (never
+        # None), so bail only on parsed JSON -- see _is_cloudflare_challenge.
+        body = getattr(error, "body", None)
+        if isinstance(body, (dict, list)):
             return False
 
         if getattr(error, "status_code", None) not in GATEWAY_WARMUP_STATUS_CODES:
