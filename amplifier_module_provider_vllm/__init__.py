@@ -109,6 +109,64 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     return cleanup
 
 
+def _build_assistant_message_item(
+    content_parts: list[dict[str, Any]],
+    message_id: str | None = None,
+) -> dict[str, Any]:
+    """Serialize assistant content as a spec-compliant Responses API message item.
+
+    Emits the canonical ``ResponseOutputMessage`` shape ("Form 2+") used when
+    assistant history is replayed in the Responses API ``input`` array. This is the
+    single form every tested backend accepts -- verified on the wire against the
+    OpenAI Responses API, llama.cpp's llama-server, and vLLM 0.19:
+
+    - ``type: "message"`` is REQUIRED by llama-server: its input-item dispatch keys
+      on the literal ``type`` field, so a role-only item 400s with
+      "Cannot determine type of 'item'".
+    - ``id`` and ``status`` are REQUIRED by vLLM: input items validate against the
+      openai SDK's ``ResponseOutputMessageParam``, which marks both required, so a
+      role-only (or bare ``type: message``) item raises ``pydantic.ValidationError``.
+    - ``annotations: []`` on each ``output_text`` part mirrors OpenAI's own output
+      items and is accepted by every backend.
+
+    Real OpenAI is permissive and accepts looser forms, but this canonical form is
+    the intersection all backends accept. Ref: OpenAI Responses API -- a "message"
+    is a discriminated Item type alongside function_call / function_call_output /
+    reasoning.
+
+    Args:
+        content_parts: Assistant output parts, each ``{"type": "output_text",
+            "text": ...}``. ``annotations`` is filled in if absent.
+        message_id: Preserved message id when available; a fresh ``msg_<hex>`` is
+            synthesized otherwise (replayed-history ids need only be valid strings,
+            not server-issued references).
+
+    Returns:
+        One Responses API assistant message item.
+    """
+    normalized: list[dict[str, Any]] = []
+    for part in content_parts:
+        if isinstance(part, dict):
+            normalized.append(
+                {
+                    "type": part.get("type", "output_text"),
+                    "text": part.get("text", ""),
+                    "annotations": part.get("annotations", []),
+                }
+            )
+        else:
+            normalized.append(
+                {"type": "output_text", "text": str(part), "annotations": []}
+            )
+    return {
+        "type": "message",
+        "id": message_id or f"msg_{uuid.uuid4().hex}",
+        "role": "assistant",
+        "status": "completed",
+        "content": normalized,
+    }
+
+
 class VLLMProvider:
     """vLLM Responses API integration (OpenAI-compatible)."""
 
@@ -364,10 +422,10 @@ class VLLMProvider:
                                     {"type": "output_text", "text": text}
                                 )
 
-        # If we extracted any assistant content, add as assistant message
+        # If we extracted any assistant content, add as a spec-compliant message item
         if assistant_content:
             continuation_input.append(
-                {"role": "assistant", "type": "message", "content": assistant_content}
+                _build_assistant_message_item(assistant_content)
             )
 
         return continuation_input
@@ -1354,11 +1412,9 @@ class VLLMProvider:
                 if text_parts:
                     combined_text = "\n".join(text_parts)
                     openai_messages.append(
-                        {
-                            "role": "assistant",
-                            "type": "message",
-                            "content": [{"type": "output_text", "text": combined_text}],
-                        }
+                        _build_assistant_message_item(
+                            [{"type": "output_text", "text": combined_text}]
+                        )
                     )
 
                 i += 1
