@@ -929,9 +929,7 @@ class VLLMProvider:
 
         # If we extracted any assistant content, add as a spec-compliant message item
         if assistant_content:
-            continuation_input.append(
-                _build_assistant_message_item(assistant_content)
-            )
+            continuation_input.append(_build_assistant_message_item(assistant_content))
 
         return continuation_input
 
@@ -1618,8 +1616,17 @@ class VLLMProvider:
                     retryable=True,
                 ) from e
 
+        # Retries that happened INSIDE this one logical call. Without it a call
+        # that swallowed three 600 s timeouts reports as a single clean success:
+        # session `eec9ae98` recorded `duration_ms: 1818942` (30.3 min) with
+        # `status: ok`, which hides the failure from every latency metric that
+        # keys on status.
+        retry_count = 0
+
         async def _on_retry(attempt: int, delay: float, error: kernel_errors.LLMError):
             """Callback invoked before each retry sleep."""
+            nonlocal retry_count
+            retry_count = attempt
             if self.coordinator and hasattr(self.coordinator, "hooks"):
                 await self.coordinator.hooks.emit(
                     PROVIDER_RETRY,
@@ -1926,6 +1933,10 @@ class VLLMProvider:
                     "usage": event_usage,
                     "status": "ok",
                     "duration_ms": elapsed_ms,
+                    # How many attempts this "success" actually cost. `elapsed_ms`
+                    # already spans the whole retry loop, so without this a long
+                    # duration is indistinguishable from a slow model.
+                    "retries": retry_count,
                     "continuation_count": continuation_count
                     if continuation_count > 0
                     else None,
@@ -1947,6 +1958,7 @@ class VLLMProvider:
                     {
                         "status": "error",
                         "duration_ms": elapsed_ms,
+                        "retries": retry_count,
                         "error": str(e),
                         "provider": self.name,
                         "model": params["model"],
@@ -1967,6 +1979,7 @@ class VLLMProvider:
                     {
                         "status": "error",
                         "duration_ms": elapsed_ms,
+                        "retries": retry_count,
                         "error": error_msg,
                         "provider": self.name,
                         "model": params["model"],
