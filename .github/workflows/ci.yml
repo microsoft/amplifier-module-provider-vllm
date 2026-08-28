@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: pytest (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    # A hang must fail LOUDLY and fast, not sit burning runner time until the
+    # 6h default -- a job stuck at "in_progress" reads as "not done yet"
+    # rather than "broken", which is how a false green gets merged.
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        # requires-python = ">=3.11" -- cover the floor and a current minor.
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: uv sync --all-extras --dev
+
+      - name: Run test suite
+        # Deselects tests marked `live`: the inherited
+        # test_list_models_returns_list makes a real network call to
+        # the configured vLLM/OpenAI-compatible endpoint. Run locally
+        # against a real server to validate.
+        run: uv run pytest -q -m "not live"
