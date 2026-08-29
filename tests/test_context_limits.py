@@ -122,13 +122,13 @@ class TestConfigFields:
         fields = {field.id: field for field in provider.get_info().config_fields}
 
         assert "context_window" in fields
-        assert "max_output_tokens" in fields
+        # max_output_tokens is no longer wizard-prompted (settings-only now)
+        assert "max_output_tokens" not in fields
+        provider2 = VLLMProvider(base_url=BASE_URL, config={"max_output_tokens": "32000"})
+        assert provider2.max_output_tokens == 32000
         assert fields["context_window"].env_var == "VLLM_CONTEXT_WINDOW"
-        assert fields["max_output_tokens"].env_var == "VLLM_MAX_OUTPUT_TOKENS"
         assert fields["context_window"].required is False
-        assert fields["max_output_tokens"].required is False
         assert fields["context_window"].default == "128000"
-        assert fields["max_output_tokens"].default == "32768"
 
 
 class TestGetModelInfo:

@@ -90,10 +90,13 @@ providers:
       priority: 100                         # Provider selection priority
 
       # Debug
-      debug: true                           # Enable detailed logging
-      raw_debug: false                      # Enable raw API I/O logging
-      debug_truncate_length: 180            # Truncate long debug strings
+      raw: false                            # Attach exact request params to llm:request
 ```
+
+`debug`, `raw_debug`, and `debug_truncate_length` are ghost keys from an
+older version of this README -- they were never read by this provider.
+Use `raw: true` to attach the exact request params sent to the server on
+the `llm:request` event.
 
 ### Stream idle timeout
 
@@ -354,12 +357,11 @@ The vLLM provider uses the **Responses API** (`/v1/responses`) which provides:
 
 ## Debugging
 
-Enable debug logging to see full request/response details:
+Enable `raw` to attach the exact request params to the `llm:request` event:
 
 ```yaml
 config:
-  debug: true        # Summary logging
-  raw_debug: true    # Complete API I/O
+  raw: true    # Attach exact request params sent to the server
 ```
 
 **Check logs:**
