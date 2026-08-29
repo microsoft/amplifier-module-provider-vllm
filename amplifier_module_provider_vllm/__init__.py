@@ -9,6 +9,7 @@ __all__ = ["mount", "VLLMProvider"]
 __amplifier_module_type__ = "provider"
 
 import asyncio
+import difflib
 import json
 import logging
 import os
@@ -57,6 +58,156 @@ from ._token_accounting import should_apply_token_accounting
 from ._truncation import check_silent_input_truncation
 
 logger = logging.getLogger(__name__)
+
+# Config keys this provider actively reads. `priority` and
+# `extra_request_params` must always stay allow-listed -- `priority` is
+# read both by the orchestrator's provider-selection logic and by this
+# module's own self.priority; extra_request_params is app-cli-reserved.
+_KNOWN_CONFIG_KEYS = frozenset(
+    {
+        "base_url",
+        "api_key",
+        "default_model",
+        "max_tokens",
+        "temperature",
+        "reasoning",
+        "reasoning_summary",
+        "reasoning_effort",
+        "truncation",
+        "enable_state",
+        "raw",
+        "timeout",
+        "stream_idle_timeout",
+        "context_window",
+        "max_output_tokens",
+        "use_streaming",
+        "priority",
+        "max_retries",
+        "min_retry_delay",
+        "max_retry_delay",
+        "retry_jitter",
+        "instance_id",
+        "extra_request_params",
+    }
+)
+
+# Targeted messages for keys that used to do something (or were documented
+# but never wired) and now have a known migration path.
+_INERT_CONFIG_KEY_MESSAGES = {
+    "debug": (
+        "Config key 'debug' is not read by this provider -- there is no "
+        "standard-debug event path. Remove it from your config."
+    ),
+    "raw_debug": (
+        "Config key 'raw_debug' is not read by this provider. Use "
+        "'raw: true' instead to attach the exact request params to the "
+        "llm:request event."
+    ),
+    "debug_truncate_length": (
+        "Config key 'debug_truncate_length' is not read by this provider "
+        "-- there is no debug-string truncation path. Remove it from your "
+        "config."
+    ),
+    "thinking_budget_tokens": (
+        "Config key 'thinking_budget_tokens' was removed -- it forced an "
+        "artificial max_output_tokens floor that fought the server's own "
+        "limits. 'extended_thinking' still forces reasoning effort but no "
+        "longer adjusts max_output_tokens; set 'max_output_tokens' "
+        "directly if you need more room."
+    ),
+    "thinking_budget_buffer": (
+        "Config key 'thinking_budget_buffer' was removed along with "
+        "'thinking_budget_tokens' (see that key's message). It has no "
+        "effect."
+    ),
+}
+
+
+def _warn_unknown_config_keys(config: dict[str, Any]) -> None:
+    """Warn (never fail) about config keys this provider doesn't recognize.
+
+    Ghost keys with a known migration path get a targeted message from
+    _INERT_CONFIG_KEY_MESSAGES; anything else gets a difflib did-you-mean
+    suggestion against the known key set.
+    """
+    for key in config:
+        if key in _KNOWN_CONFIG_KEYS:
+            continue
+        if key in _INERT_CONFIG_KEY_MESSAGES:
+            logger.warning("[PROVIDER] %s", _INERT_CONFIG_KEY_MESSAGES[key])
+            continue
+        suggestions = difflib.get_close_matches(key, _KNOWN_CONFIG_KEYS, n=1)
+        hint = f" Did you mean '{suggestions[0]}'?" if suggestions else ""
+        logger.warning("[PROVIDER] Unknown config key '%s' is ignored.%s", key, hint)
+
+
+def _coerce_bool(value: Any, *, key: str, default: bool) -> bool:
+    """Coerce a config value to bool, tolerating string forms from wizards.
+
+    Config wizards commonly persist booleans as the strings "true"/"false".
+    ``bool("false")`` evaluates to ``True`` in Python -- this parses the
+    string content instead of relying on Python truthiness.
+    """
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in ("true", "1", "yes"):
+            return True
+        if normalized in ("false", "0", "no"):
+            return False
+        logger.warning(
+            "[PROVIDER] Config key '%s' has unrecognized boolean value %r; "
+            "defaulting to %s.",
+            key,
+            value,
+            default,
+        )
+        return default
+    logger.warning(
+        "[PROVIDER] Config key '%s' has unexpected type %s for a boolean "
+        "value (%r); coercing with bool().",
+        key,
+        type(value).__name__,
+        value,
+    )
+    return bool(value)
+
+
+def _coerce_float(value: Any, *, key: str, default: float) -> float:
+    """Coerce a config value to float, warning and defaulting on failure."""
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        logger.warning(
+            "[PROVIDER] Config key '%s' has invalid float value %r; "
+            "defaulting to %s.",
+            key,
+            value,
+            default,
+        )
+        return default
+
+
+def _coerce_int(value: Any, *, key: str, default: int) -> int:
+    """Coerce a config value to int, warning and defaulting on failure."""
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        logger.warning(
+            "[PROVIDER] Config key '%s' has invalid integer value %r; "
+            "defaulting to %s.",
+            key,
+            value,
+            default,
+        )
+        return default
 
 
 def _is_remote_host(base_url: str | None) -> bool:
@@ -279,8 +430,11 @@ class VLLMProvider:
             raise ValueError("base_url or client must be provided for API calls")
 
         # Configuration with sensible defaults (from _constants.py - single source of truth)
+        _warn_unknown_config_keys(self.config)
         self.default_model = self.config.get("default_model", DEFAULT_MODEL)
-        self.max_tokens = self.config.get("max_tokens", DEFAULT_MAX_TOKENS)
+        self.max_tokens = _coerce_int(
+            self.config.get("max_tokens"), key="max_tokens", default=DEFAULT_MAX_TOKENS
+        )
         self.temperature = self.config.get(
             "temperature", None
         )  # None = not sent (some models don't support it)
@@ -293,18 +447,25 @@ class VLLMProvider:
         self.truncation = self.config.get(
             "truncation", DEFAULT_TRUNCATION
         )  # Automatic context management
-        self.enable_state = self.config.get("enable_state", False)
-        self.raw = self.config.get("raw", False)  # Include raw API I/O in base events
-        self.timeout = self.config.get("timeout", DEFAULT_TIMEOUT)
+        self.enable_state = _coerce_bool(
+            self.config.get("enable_state"), key="enable_state", default=False
+        )
+        self.raw = _coerce_bool(
+            self.config.get("raw"), key="raw", default=False
+        )  # Include raw API I/O in base events
+        self.timeout = _coerce_float(
+            self.config.get("timeout"), key="timeout", default=DEFAULT_TIMEOUT
+        )
 
         # Inter-chunk idle timeout for streaming (seconds).
         # Resolution: config -> VLLM_STREAM_IDLE_TIMEOUT env var -> default
         # constant (same pattern as base_url/api_key). See _constants.py for
         # the default's rationale (long prefill TTFT vs never-hang-forever).
-        self.stream_idle_timeout = float(
+        self.stream_idle_timeout = _coerce_float(
             self.config.get("stream_idle_timeout")
-            or os.environ.get("VLLM_STREAM_IDLE_TIMEOUT")
-            or DEFAULT_STREAM_IDLE_TIMEOUT
+            or os.environ.get("VLLM_STREAM_IDLE_TIMEOUT"),
+            key="stream_idle_timeout",
+            default=DEFAULT_STREAM_IDLE_TIMEOUT,
         )
 
         # Advertised model limits for downstream context managers (token budgeting).
@@ -313,15 +474,16 @@ class VLLMProvider:
         # (same config-then-env pattern as base_url/api_key in mount()).
         # NOTE: max_output_tokens is the advertised model maximum output —
         # a different concept from self.max_tokens (per-request completion cap).
-        self.context_window = int(
-            self.config.get("context_window")
-            or os.environ.get("VLLM_CONTEXT_WINDOW")
-            or DEFAULT_CONTEXT_WINDOW
+        self.context_window = _coerce_int(
+            self.config.get("context_window") or os.environ.get("VLLM_CONTEXT_WINDOW"),
+            key="context_window",
+            default=DEFAULT_CONTEXT_WINDOW,
         )
-        self.max_output_tokens = int(
+        self.max_output_tokens = _coerce_int(
             self.config.get("max_output_tokens")
-            or os.environ.get("VLLM_MAX_OUTPUT_TOKENS")
-            or DEFAULT_MAX_OUTPUT_TOKENS
+            or os.environ.get("VLLM_MAX_OUTPUT_TOKENS"),
+            key="max_output_tokens",
+            default=DEFAULT_MAX_OUTPUT_TOKENS,
         )
 
         # Whether the operator EXPLICITLY set context_window (config key or
@@ -347,18 +509,45 @@ class VLLMProvider:
         # Streaming flag — when True (default), emits llm:stream_* contract events
         # via chunked HTTP transport. Set to False to use the blocking create() path
         # (useful for background tasks like session-namer that must NOT stream).
-        self.use_streaming = self.config.get("use_streaming", True)
+        self.use_streaming = _coerce_bool(
+            self.config.get("use_streaming"), key="use_streaming", default=True
+        )
 
         # Provider priority for selection (lower = higher priority)
-        self.priority = self.config.get("priority", 100)
+        self.priority = _coerce_int(
+            self.config.get("priority"), key="priority", default=100
+        )
 
         # Retry configuration — delegates to shared retry_with_backoff() from amplifier-core.
         self._retry_config = RetryConfig(
-            max_retries=int(self.config.get("max_retries", 5)),
-            initial_delay=float(self.config.get("min_retry_delay", 1.0)),
-            max_delay=float(self.config.get("max_retry_delay", 60.0)),
-            jitter=bool(self.config.get("retry_jitter", True)),
+            max_retries=_coerce_int(
+                self.config.get("max_retries"), key="max_retries", default=5
+            ),
+            initial_delay=_coerce_float(
+                self.config.get("min_retry_delay"), key="min_retry_delay", default=1.0
+            ),
+            max_delay=_coerce_float(
+                self.config.get("max_retry_delay"), key="max_retry_delay", default=60.0
+            ),
+            jitter=_coerce_bool(
+                self.config.get("retry_jitter"), key="retry_jitter", default=True
+            ),
         )
+
+        # Arbitrary Responses-API payload fields merged in last (after every
+        # other field is computed) into BOTH the main request build and the
+        # auto-continuation build (see _build_continuation_params usage
+        # below) -- an escape hatch for any field this provider doesn't
+        # expose a dedicated field for.
+        _extra_raw = self.config.get("extra_request_params")
+        if _extra_raw is not None and not isinstance(_extra_raw, dict):
+            logger.warning(
+                "[PROVIDER] Config key 'extra_request_params' must be a "
+                "dict; got %s. Ignoring.",
+                type(_extra_raw).__name__,
+            )
+            _extra_raw = None
+        self.extra_request_params: dict[str, Any] = _extra_raw or {}
 
         # Track tool call IDs that have been repaired with synthetic results.
         # This prevents infinite loops when the same missing tool results are
@@ -530,57 +719,29 @@ class VLLMProvider:
                     default="EMPTY",
                     required=False,
                 ),
-                # Inter-chunk idle timeout for streaming. Bounds the wait for
-                # every chunk (including the first) so a connection dropped
-                # without close by a hosted-GPU proxy surfaces as a retryable
-                # timeout instead of hanging the session forever (#339).
-                ConfigField(
-                    id="stream_idle_timeout",
-                    display_name="Stream Idle Timeout",
-                    prompt=(
-                        "Max seconds to wait between streamed chunks before "
-                        "aborting (generous: long prefill on 60-90k-token "
-                        "prompts legitimately takes minutes)"
-                    ),
-                    field_type="text",
-                    env_var="VLLM_STREAM_IDLE_TIMEOUT",
-                    default=str(DEFAULT_STREAM_IDLE_TIMEOUT),
-                    required=False,
-                ),
                 # vLLM's /v1/models model cards expose max_model_len, so
                 # context_window is normally auto-discovered per model (see
                 # _resolve_limits()) and this field acts as an override/cap
                 # rather than the only source of truth. It still matters for
-                # proxies that strip that field, and for max_output_tokens,
-                # which no /v1/models response carries.
+                # proxies that strip that field.
                 ConfigField(
                     id="context_window",
                     display_name="Context Window",
                     prompt=(
-                        "Context window in tokens advertised to the context "
-                        "manager (auto-discovered from the server's model "
-                        "card when available; this value acts as an "
-                        "override/cap)"
+                        "Context window in tokens (blank = auto-discover "
+                        "from the server's model card)"
                     ),
                     field_type="text",
                     env_var="VLLM_CONTEXT_WINDOW",
                     default=str(DEFAULT_CONTEXT_WINDOW),
                     required=False,
                 ),
-                ConfigField(
-                    id="max_output_tokens",
-                    display_name="Max Output Tokens",
-                    prompt=(
-                        "Maximum output tokens advertised to the context "
-                        "manager (model maximum, not the per-request "
-                        "max_tokens cap; vLLM's model cards do not expose "
-                        "this, so it is never auto-discovered)"
-                    ),
-                    field_type="text",
-                    env_var="VLLM_MAX_OUTPUT_TOKENS",
-                    default=str(DEFAULT_MAX_OUTPUT_TOKENS),
-                    required=False,
-                ),
+                # NOTE: stream_idle_timeout and max_output_tokens are still
+                # fully supported config keys (see README) -- they are just
+                # no longer prompted by the setup wizard, which now only
+                # asks for the connection essentials plus the one limit
+                # (context_window) that most commonly needs a manual cap.
+                # Set the other two directly in settings.yaml when needed.
             ],
         )
 
@@ -1260,41 +1421,26 @@ class VLLMProvider:
             f"[PROVIDER] {self.api_label} API call - model: {params['model']}, has_instructions: {bool(instructions)}, tools: {len(request.tools) if request.tools else 0}"
         )
 
+        # NOTE: `thinking_budget_tokens`/`thinking_budget_buffer` were removed
+        # (see _INERT_CONFIG_KEY_MESSAGES) -- they forced an artificial
+        # max_output_tokens floor that fought the server's own limits.
+        # `extended_thinking` still forces the reasoning effort below but no
+        # longer adjusts max_output_tokens; set `max_output_tokens` directly
+        # if a thinking-heavy response needs more room.
         thinking_enabled = bool(kwargs.get("extended_thinking"))
-        thinking_budget = None
-        if thinking_enabled:
-            if "reasoning" not in params:
-                params["reasoning"] = {
-                    "effort": kwargs.get("reasoning_effort")
-                    or self.config.get("reasoning_effort", "high"),
-                    "summary": self.reasoning_summary,  # Verbosity: auto|concise|detailed
-                }
-
-            budget_tokens = (
-                kwargs.get("thinking_budget_tokens")
-                or self.config.get("thinking_budget_tokens")
-                or 0
-            )
-            buffer_tokens = kwargs.get("thinking_budget_buffer") or self.config.get(
-                "thinking_budget_buffer", 1024
-            )
-
-            if budget_tokens:
-                thinking_budget = budget_tokens
-                target_tokens = budget_tokens + buffer_tokens
-                if params.get("max_output_tokens"):
-                    params["max_output_tokens"] = max(
-                        params["max_output_tokens"], target_tokens
-                    )
-                else:
-                    params["max_output_tokens"] = target_tokens
-
+        if thinking_enabled and "reasoning" not in params:
+            params["reasoning"] = {
+                "effort": kwargs.get("reasoning_effort")
+                or self.config.get("reasoning_effort", "high"),
+                "summary": self.reasoning_summary,  # Verbosity: auto|concise|detailed
+            }
             logger.info(
-                "[PROVIDER] Extended thinking enabled (effort=%s, budget=%s, buffer=%s)",
+                "[PROVIDER] Extended thinking enabled (effort=%s)",
                 params["reasoning"]["effort"],
-                thinking_budget or "default",
-                buffer_tokens,
             )
+
+        if self.extra_request_params:
+            params.update(self.extra_request_params)
 
         # Emit llm:request event
         if self.coordinator and hasattr(self.coordinator, "hooks"):
@@ -1305,7 +1451,6 @@ class VLLMProvider:
                 "has_instructions": bool(instructions),
                 "reasoning_enabled": params.get("reasoning") is not None,
                 "thinking_enabled": thinking_enabled,
-                "thinking_budget": thinking_budget,
             }
             if self.raw:
                 request_payload["raw"] = redact_secrets(params)
@@ -1723,6 +1868,8 @@ class VLLMProvider:
                     )
                 if "store" in params:
                     continue_params["store"] = params["store"]
+                if self.extra_request_params:
+                    continue_params.update(self.extra_request_params)
 
                 # Make continuation call (streaming or blocking)
                 try:

@@ -352,8 +352,8 @@ def test_string_config_value_coerced_to_float(monkeypatch):
 def test_config_fields_include_stream_idle_timeout():
     provider = _bare_provider()
     fields = {f.id: f for f in provider.get_info().config_fields}
-    assert "stream_idle_timeout" in fields
-    field = fields["stream_idle_timeout"]
-    assert field.env_var == "VLLM_STREAM_IDLE_TIMEOUT"
-    assert float(field.default) == DEFAULT_STREAM_IDLE_TIMEOUT
-    assert field.required is False
+    # stream_idle_timeout is no longer wizard-prompted (settings-only now)
+    assert "stream_idle_timeout" not in fields
+    provider2 = _bare_provider()
+    provider2.config = {"stream_idle_timeout": "45.0"}
+    # settings-only: still overridable directly, just not via the wizard
