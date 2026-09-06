@@ -37,6 +37,7 @@ from amplifier_core.message_models import ToolCall
 from amplifier_core.utils.retry import RetryConfig, retry_with_backoff
 from openai import AsyncOpenAI
 
+from ._constants import DEFAULT_CLOSE_TIMEOUT
 from ._constants import DEFAULT_CONTEXT_WINDOW
 from ._constants import DEFAULT_MAX_OUTPUT_TOKENS
 from ._constants import DEFAULT_MAX_TOKENS
@@ -88,6 +89,7 @@ _KNOWN_CONFIG_KEYS = frozenset(
         "retry_jitter",
         "instance_id",
         "extra_request_params",
+        "close_timeout",
     }
 )
 
@@ -431,6 +433,14 @@ class VLLMProvider:
 
         # Configuration with sensible defaults (from _constants.py - single source of truth)
         _warn_unknown_config_keys(self.config)
+        # Ceiling on how long close() will wait for the HTTP client to shut
+        # down before abandoning it. Bounds session cleanup against a wedged
+        # httpx transport whose close() never returns. See close().
+        self.close_timeout = _coerce_float(
+            self.config.get("close_timeout"),
+            key="close_timeout",
+            default=DEFAULT_CLOSE_TIMEOUT,
+        )
         self.default_model = self.config.get("default_model", DEFAULT_MODEL)
         self.max_tokens = _coerce_int(
             self.config.get("max_tokens"), key="max_tokens", default=DEFAULT_MAX_TOKENS
@@ -2708,7 +2718,40 @@ class VLLMProvider:
         return chat_response
 
     async def close(self) -> None:
-        """Close the underlying OpenAI-compatible client to prevent resource leaks."""
-        if self._client is not None:
-            await self._client.close()
-            self._client = None
+        """Close the OpenAI-compatible client, within a time bound.
+
+        Bounded by ``self.close_timeout`` (config key ``close_timeout``,
+        default 5.0s). ``mount()``'s ``cleanup()`` awaits this directly, so
+        an unbounded await here hangs Amplifier's session cleanup for the
+        whole process whenever the httpx transport has a wedged connection
+        and ``AsyncOpenAI.close()`` never returns. A self-hosted vLLM server
+        behind a flaky gateway is exactly where that happens.
+
+        ``asyncio.shield`` keeps the close running to completion if the
+        *enclosing* task is cancelled; ``asyncio.wait_for`` caps how long we
+        wait for it. On timeout we log a WARNING naming this provider
+        instance and the abandoned client, then return -- a slow close must
+        never become a hung session.
+
+        ``self._client`` is cleared before the await so the lazy-init
+        property rebuilds a fresh client on next use, and so a client whose
+        close raised or timed out is not left behind to be reused.
+        """
+        client = self._client
+        if client is None:
+            return
+        self._client = None
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(client.close()), timeout=self.close_timeout
+            )
+        except TimeoutError:
+            logger.warning(
+                "[PROVIDER] %s: HTTP client close did not complete within "
+                "%.1fs; abandoning client %r. Its transport may leak until "
+                "the process exits. Raise 'close_timeout' in this provider's "
+                "config if a slow close is expected.",
+                self.name,
+                self.close_timeout,
+                client,
+            )
