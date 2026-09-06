@@ -69,6 +69,12 @@ DEFAULT_TRUNCATION = "disabled"
 # as a retryable error instead of hanging forever.
 DEFAULT_STREAM_IDLE_TIMEOUT = 300.0  # 5 minutes
 
+# Ceiling on how long close() waits for the HTTP client to shut down. An
+# httpx transport with a wedged connection can leave AsyncOpenAI.close()
+# pending indefinitely; without a bound, that hangs session cleanup for the
+# whole process. See VLLMProvider.close().
+DEFAULT_CLOSE_TIMEOUT = 5.0  # seconds
+
 # Fallback model limits for downstream context managers.
 # vLLM's /v1/models model cards expose the real context length
 # (max_model_len), so context_window is normally discovered per model at
