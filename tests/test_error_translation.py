@@ -178,6 +178,54 @@ def test_api_status_error_5xx_translated():
     assert err.__cause__ is native
 
 
+def test_instant_timeout_408_retryable():
+    """Gateway 408 with 'time taken=0.0' (request never reached backend) -> retryable LLMTimeoutError."""
+    provider = _make_provider()
+    native = openai.APIStatusError(
+        "Error code: 408",
+        response=_mock_httpx_response(408),
+        body={
+            "message": "Request timed out. error_type=APITimeoutError, "
+            "timeout value=55.0, time taken=0.0 seconds",
+            "code": 408,
+        },
+    )
+    provider.client.responses.create = AsyncMock(side_effect=native)
+
+    with pytest.raises(kernel_errors.LLMTimeoutError) as exc_info:
+        asyncio.run(provider.complete(_simple_request()))
+
+    err = exc_info.value
+    assert err.provider == "vllm"
+    assert err.retryable is True
+    assert err.__cause__ is native
+
+
+def test_genuine_timeout_408_not_retryable():
+    """Gateway 408 with elapsed time (real upstream timeout) -> non-retryable LLMError."""
+    provider = _make_provider()
+    native = openai.APIStatusError(
+        "Error code: 408",
+        response=_mock_httpx_response(408),
+        body={
+            "message": "Request timed out. error_type=APITimeoutError, "
+            "timeout value=55.0, time taken=55.02 seconds",
+            "code": 408,
+        },
+    )
+    provider.client.responses.create = AsyncMock(side_effect=native)
+
+    with pytest.raises(kernel_errors.LLMError) as exc_info:
+        asyncio.run(provider.complete(_simple_request()))
+
+    err = exc_info.value
+    assert not isinstance(err, kernel_errors.LLMTimeoutError)
+    assert err.provider == "vllm"
+    assert err.status_code == 408
+    assert err.retryable is False
+    assert err.__cause__ is native
+
+
 def test_timeout_error_translated():
     """asyncio.TimeoutError -> kernel LLMTimeoutError (retryable=True)."""
     provider = _make_provider()
