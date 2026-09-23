@@ -178,7 +178,7 @@ def _coerce_bool(value: Any, *, key: str, default: bool) -> bool:
     return bool(value)
 
 
-def _coerce_float(value: Any, *, key: str, default: float) -> float:
+def _coerce_float(value: Any, *, key: str, default: float | None) -> float | None:
     """Coerce a config value to float, warning and defaulting on failure."""
     if value is None:
         return default
@@ -470,13 +470,16 @@ class VLLMProvider:
         # Inter-chunk idle timeout for streaming (seconds).
         # Resolution: config -> VLLM_STREAM_IDLE_TIMEOUT env var -> default
         # constant (same pattern as base_url/api_key). See _constants.py for
-        # the default's rationale (long prefill TTFT vs never-hang-forever).
+        # rationale: silence alone does not establish transport failure.
         self.stream_idle_timeout = _coerce_float(
-            self.config.get("stream_idle_timeout")
-            or os.environ.get("VLLM_STREAM_IDLE_TIMEOUT"),
+            self.config.get(
+                "stream_idle_timeout", os.environ.get("VLLM_STREAM_IDLE_TIMEOUT")
+            ),
             key="stream_idle_timeout",
             default=DEFAULT_STREAM_IDLE_TIMEOUT,
         )
+
+        self._sdk_timeout = openai.Timeout(self.timeout, connect=5.0, pool=5.0)
 
         # Advertised model limits for downstream context managers (token budgeting).
         # vLLM does not expose context length via /v1/models, so these are
@@ -573,6 +576,7 @@ class VLLMProvider:
                 raise ValueError("base_url or client must be provided for API calls")
             self._client = AsyncOpenAI(
                 base_url=self.base_url,
+                timeout=self._sdk_timeout,
                 api_key=self.api_key,  # From config, env, or "EMPTY" for local
                 max_retries=0,  # Phase 2: Disable SDK retries — we handle retry ourselves
             )
@@ -696,7 +700,7 @@ class VLLMProvider:
                 "model": self.default_model,
                 "max_tokens": 16384,
                 "temperature": None,
-                "timeout": 600.0,
+                "timeout": None,
                 "context_window": self.context_window,
                 "max_output_tokens": self.max_output_tokens,
             },
@@ -834,15 +838,10 @@ class VLLMProvider:
         return models
 
     async def _iter_with_idle_timeout(self, stream):
-        """Yield stream events, bounding the wait between chunks.
+        """Yield events with an optional operator-configured idle deadline.
 
-        Hosted-GPU HTTPS proxies (RunPod et al.) drop quiet connections
-        without FIN, leaving an established stream silently hung: no chunk,
-        no exception, forever. This wrapper bounds the wait for EVERY chunk
-        — including the FIRST (a hang before the first chunk is the same
-        failure mode) — and aborts with a retryable LLMTimeoutError so that
-        upstream retry logic (retry_with_backoff) engages instead of the
-        session hanging indefinitely. See microsoft/amplifier#339.
+        Quiet model prefill or reasoning does not prove transport failure.
+        The default therefore waits for a chunk, cancellation, or a real error.
         """
         iterator = stream.__aiter__()
         while True:
@@ -1512,7 +1511,9 @@ class VLLMProvider:
 
                     try:
                         async with asyncio.timeout(self.timeout):
-                            async with self.client.responses.stream(**params) as stream:
+                            async with self.client.responses.stream(
+                                **params, timeout=self._sdk_timeout
+                            ) as stream:
                                 async for event in self._iter_with_idle_timeout(stream):
                                     if hooks_available:
                                         et = event.type
@@ -1630,7 +1631,8 @@ class VLLMProvider:
                     # Non-streaming fallback — preserved for backward compat and
                     # for callers that pass metadata={"stream": False}.
                     return await asyncio.wait_for(
-                        self.client.responses.create(**params), timeout=self.timeout
+                        self.client.responses.create(**params, timeout=self._sdk_timeout),
+                        timeout=self.timeout
                     )
             except openai.RateLimitError as e:
                 retry_after = None
@@ -1900,7 +1902,7 @@ class VLLMProvider:
 
                         async with asyncio.timeout(self.timeout):
                             async with self.client.responses.stream(
-                                **continue_params
+                                **continue_params, timeout=self._sdk_timeout
                             ) as cont_stream:
                                 async for event in self._iter_with_idle_timeout(
                                     cont_stream
@@ -2003,7 +2005,9 @@ class VLLMProvider:
                     else:
                         # Non-streaming continuation fallback
                         final_response = await asyncio.wait_for(
-                            self.client.responses.create(**continue_params),
+                            self.client.responses.create(
+                                **continue_params, timeout=self._sdk_timeout
+                            ),
                             timeout=self.timeout,
                         )
 
