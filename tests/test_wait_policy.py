@@ -203,3 +203,49 @@ async def test_actual_sdk_request_disables_hidden_read_deadline(streaming):
         assert "timeout" not in json.loads(seen[0].content)
     finally:
         await provider.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("override", [None, 30])
+async def test_explicit_extra_request_timeout_is_preserved(streaming, override):
+    provider, request, entered, release, _, call = setup_call(
+        streaming, {"extra_request_params": {"timeout": override}}
+    )
+    task = asyncio.create_task(provider.complete(request))
+    await entered.wait()
+    release.set()
+    await task
+    assert "timeout" in call.call_args.kwargs
+    assert call.call_args.kwargs["timeout"] == override
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("override", [None, 30])
+async def test_extra_timeout_survives_continuation_round(streaming, override):
+    from tests.test_streaming import FakeStream
+
+    provider = VLLMProvider(
+        base_url="https://test.invalid/v1",
+        config={
+            "use_streaming": streaming,
+            "max_retries": 0,
+            "default_model": "meta-llama/Llama-3-8B",
+            "extra_request_params": {"timeout": override},
+        },
+    )
+    provider.coordinator = FakeCoordinator()
+    provider._client = MagicMock()
+    responses = [_make_response(status="incomplete"), _make_response(resp_id="final")]
+    if streaming:
+        call = provider._client.responses.stream = MagicMock(
+            side_effect=[FakeStream([], response) for response in responses]
+        )
+    else:
+        call = provider._client.responses.create = AsyncMock(side_effect=responses)
+    await provider.complete(
+        ChatRequest(messages=[Message(role="user", content="hello")])
+    )
+    assert call.call_count == 2
+    assert all(args.kwargs["timeout"] == override for args in call.call_args_list)

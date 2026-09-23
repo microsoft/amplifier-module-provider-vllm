@@ -1493,6 +1493,8 @@ class VLLMProvider:
 
         async def _do_complete():
             """Single API call attempt with SDK → kernel error translation."""
+            # Preserve explicit SDK transport overrides without duplicate kwargs.
+            sdk_params = {"timeout": self._sdk_timeout, **params}
             try:
                 if _use_streaming:
                     # -------------------------------------------------------
@@ -1511,9 +1513,7 @@ class VLLMProvider:
 
                     try:
                         async with asyncio.timeout(self.timeout):
-                            async with self.client.responses.stream(
-                                **params, timeout=self._sdk_timeout
-                            ) as stream:
+                            async with self.client.responses.stream(**sdk_params) as stream:
                                 async for event in self._iter_with_idle_timeout(stream):
                                     if hooks_available:
                                         et = event.type
@@ -1631,8 +1631,8 @@ class VLLMProvider:
                     # Non-streaming fallback — preserved for backward compat and
                     # for callers that pass metadata={"stream": False}.
                     return await asyncio.wait_for(
-                        self.client.responses.create(**params, timeout=self._sdk_timeout),
-                        timeout=self.timeout
+                        self.client.responses.create(**sdk_params),
+                        timeout=self.timeout,
                     )
             except openai.RateLimitError as e:
                 retry_after = None
@@ -1883,6 +1883,7 @@ class VLLMProvider:
                 if self.extra_request_params:
                     continue_params.update(self.extra_request_params)
 
+                continue_sdk_params = {"timeout": self._sdk_timeout, **continue_params}
                 # Make continuation call (streaming or blocking)
                 try:
                     continue_start = time.time()
@@ -1902,7 +1903,7 @@ class VLLMProvider:
 
                         async with asyncio.timeout(self.timeout):
                             async with self.client.responses.stream(
-                                **continue_params, timeout=self._sdk_timeout
+                                **continue_sdk_params
                             ) as cont_stream:
                                 async for event in self._iter_with_idle_timeout(
                                     cont_stream
@@ -2005,9 +2006,7 @@ class VLLMProvider:
                     else:
                         # Non-streaming continuation fallback
                         final_response = await asyncio.wait_for(
-                            self.client.responses.create(
-                                **continue_params, timeout=self._sdk_timeout
-                            ),
+                            self.client.responses.create(**continue_sdk_params),
                             timeout=self.timeout,
                         )
 
