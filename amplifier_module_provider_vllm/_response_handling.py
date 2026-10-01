@@ -11,6 +11,7 @@ import json
 import logging
 from typing import Any
 
+from amplifier_core import llm_errors
 from amplifier_core import TextContent
 from amplifier_core import ThinkingContent
 from amplifier_core import ToolCallContent
@@ -26,6 +27,48 @@ from ._constants import METADATA_RESPONSE_ID
 from ._constants import METADATA_STATUS
 
 logger = logging.getLogger(__name__)
+
+
+def validate_function_completion(
+    block: Any, response_status: str | None = None
+) -> None:
+    """Never turn truncated function arguments into an executable empty object."""
+    status = (
+        block.get("status")
+        if isinstance(block, dict)
+        else getattr(block, "status", None)
+    )
+    if status == "incomplete" or (
+        response_status == "incomplete" and status != "completed"
+    ):
+        raise llm_errors.LLMError(
+            "The provider returned an incomplete function call; it cannot be executed.",
+            provider="vllm",
+            retryable=False,
+        )
+
+
+def usage_from_response(response: Any) -> Usage:
+    """Read measured usage without parsing/executing incomplete content."""
+    usage = getattr(response, "usage", None)
+
+    def number(obj, field):
+        value = getattr(obj, field, None)
+        return value if type(value) is int and value >= 0 else None
+
+    input_tokens = number(usage, "input_tokens") or 0
+    output_tokens = number(usage, "output_tokens") or 0
+    return Usage(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=input_tokens + output_tokens,
+        reasoning_tokens=number(
+            getattr(usage, "output_tokens_details", None), "reasoning_tokens"
+        ),
+        cache_read_tokens=number(
+            getattr(usage, "input_tokens_details", None), "cached_tokens"
+        ),
+    )
 
 
 def convert_response_with_accumulated_output(
@@ -116,6 +159,9 @@ def convert_response_with_accumulated_output(
                     # NOTE: Do NOT add reasoning to text_accumulator - it's internal process, not response content
 
             elif block_type in {"tool_call", "function_call"}:
+                validate_function_completion(
+                    block, getattr(final_response, "status", None)
+                )
                 # Keep the invocation ID, not the SDK's output-item ID.
                 tool_id = getattr(block, "call_id", "") or getattr(block, "id", "")
                 tool_name = getattr(block, "name", "")
@@ -200,6 +246,9 @@ def convert_response_with_accumulated_output(
                     # NOTE: Do NOT add reasoning to text_accumulator - it's internal process, not response content
 
             elif block_type in {"tool_call", "function_call"}:
+                validate_function_completion(
+                    block, getattr(final_response, "status", None)
+                )
                 tool_id = block.get("call_id") or block.get("id", "")
                 tool_name = block.get("name", "")
                 tool_input = block.get("input")
@@ -293,7 +342,11 @@ def convert_response_with_accumulated_output(
         content=content_blocks,
         tool_calls=tool_calls if tool_calls else None,
         usage=usage,
-        finish_reason=getattr(final_response, "finish_reason", None),
+        finish_reason=(
+            "length"
+            if getattr(final_response, "status", None) == "incomplete"
+            else getattr(final_response, "finish_reason", None)
+        ),
         content_blocks=event_blocks if event_blocks else None,
         text=combined_text or None,
         metadata=metadata if metadata else None,
