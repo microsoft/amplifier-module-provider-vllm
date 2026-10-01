@@ -100,22 +100,17 @@ the `llm:request` event.
 
 ### Stream idle timeout
 
-`stream_idle_timeout` bounds how long the provider waits **between streamed
-chunks** — including the wait for the *first* chunk — before aborting the
-stream with a retryable timeout error.
+Model requests and streaming reads have no elapsed-time deadline by default.
+They wait for completion, cancellation, or a real provider/transport failure.
+Quiet prefill or thinking alone does not establish a failed connection.
 
-- **Default**: `300.0` seconds (5 minutes)
-- **Env var**: `VLLM_STREAM_IDLE_TIMEOUT` (config value takes precedence)
+Set `timeout` to opt into a request deadline. Set `stream_idle_timeout` or
+`VLLM_STREAM_IDLE_TIMEOUT` to opt into a limit between streamed chunks, including
+the first chunk. Both defaults are `null`; an explicit `null` config value also
+turns off an environment-provided idle limit. Explicit numeric limits retain
+retryable timeout errors. Connection and pool acquisition stay bounded to
+5 seconds, and `close_timeout` continues to bound cleanup.
 
-Why it exists: remote vLLM endpoints behind hosted-GPU HTTPS proxies
-(RunPod et al.) routinely drop quiet connections *without close*. Before
-this knob, a mid-generation drop raised no exception and left the session
-hanging silently forever (observed: ~8.7 hours mid-turn). The default is
-deliberately generous because this endpoint class legitimately has long
-time-to-first-token during prefill of 60–90k-token prompts — minutes, not
-seconds — so the window must never false-positive on a healthy long
-prefill while still guaranteeing a hung stream surfaces as a retryable
-error. Non-streaming calls are unaffected (bounded by `timeout`).
 ### Context limits
 
 vLLM's `/v1/models` model cards expose the loaded model's real context
