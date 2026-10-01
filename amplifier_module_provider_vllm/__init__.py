@@ -53,6 +53,7 @@ from ._constants import METADATA_INCOMPLETE_REASON
 from ._constants import METADATA_RESPONSE_ID
 from ._constants import METADATA_STATUS
 from ._cost import compute_cost
+from ._response_handling import usage_from_response, validate_function_completion
 from ._response_handling import convert_response_with_accumulated_output
 from ._token_accounting import apply_token_accounting
 from ._token_accounting import should_apply_token_accounting
@@ -82,6 +83,7 @@ _KNOWN_CONFIG_KEYS = frozenset(
         "context_window",
         "max_output_tokens",
         "use_streaming",
+        "auto_continue",
         "priority",
         "max_retries",
         "min_retry_delay",
@@ -178,7 +180,7 @@ def _coerce_bool(value: Any, *, key: str, default: bool) -> bool:
     return bool(value)
 
 
-def _coerce_float(value: Any, *, key: str, default: float) -> float:
+def _coerce_float(value: Any, *, key: str, default: float | None) -> float | None:
     """Coerce a config value to float, warning and defaulting on failure."""
     if value is None:
         return default
@@ -470,13 +472,16 @@ class VLLMProvider:
         # Inter-chunk idle timeout for streaming (seconds).
         # Resolution: config -> VLLM_STREAM_IDLE_TIMEOUT env var -> default
         # constant (same pattern as base_url/api_key). See _constants.py for
-        # the default's rationale (long prefill TTFT vs never-hang-forever).
+        # rationale: silence alone does not establish transport failure.
         self.stream_idle_timeout = _coerce_float(
-            self.config.get("stream_idle_timeout")
-            or os.environ.get("VLLM_STREAM_IDLE_TIMEOUT"),
+            self.config.get(
+                "stream_idle_timeout", os.environ.get("VLLM_STREAM_IDLE_TIMEOUT")
+            ),
             key="stream_idle_timeout",
             default=DEFAULT_STREAM_IDLE_TIMEOUT,
         )
+
+        self._sdk_timeout = openai.Timeout(self.timeout, connect=5.0, pool=5.0)
 
         # Advertised model limits for downstream context managers (token budgeting).
         # vLLM does not expose context length via /v1/models, so these are
@@ -519,6 +524,9 @@ class VLLMProvider:
         # Streaming flag — when True (default), emits llm:stream_* contract events
         # via chunked HTTP transport. Set to False to use the blocking create() path
         # (useful for background tasks like session-namer that must NOT stream).
+        self.auto_continue = _coerce_bool(
+            self.config.get("auto_continue"), key="auto_continue", default=True
+        )
         self.use_streaming = _coerce_bool(
             self.config.get("use_streaming"), key="use_streaming", default=True
         )
@@ -573,6 +581,7 @@ class VLLMProvider:
                 raise ValueError("base_url or client must be provided for API calls")
             self._client = AsyncOpenAI(
                 base_url=self.base_url,
+                timeout=self._sdk_timeout,
                 api_key=self.api_key,  # From config, env, or "EMPTY" for local
                 max_retries=0,  # Phase 2: Disable SDK retries — we handle retry ourselves
             )
@@ -690,17 +699,26 @@ class VLLMProvider:
                 "streaming",
                 "tools",
                 "reasoning",
+                "completion:auto_continue:v1",
                 "remote" if self._is_remote_cached else "local",
             ],
             defaults={
                 "model": self.default_model,
                 "max_tokens": 16384,
                 "temperature": None,
-                "timeout": 600.0,
+                "timeout": None,
                 "context_window": self.context_window,
                 "max_output_tokens": self.max_output_tokens,
             },
             config_fields=[
+                ConfigField(
+                    id="auto_continue",
+                    display_name="Continue truncated responses",
+                    field_type="boolean",
+                    prompt="Automatically continue responses that reach the output limit",
+                    default="true",
+                    required=False,
+                ),
                 # base_url is the single source of truth for local-vs-remote.
                 # Localhost URLs are treated as local; any other URL is treated
                 # as remote (capability-tagged accordingly). To run BOTH a local
@@ -834,15 +852,10 @@ class VLLMProvider:
         return models
 
     async def _iter_with_idle_timeout(self, stream):
-        """Yield stream events, bounding the wait between chunks.
+        """Yield events with an optional operator-configured idle deadline.
 
-        Hosted-GPU HTTPS proxies (RunPod et al.) drop quiet connections
-        without FIN, leaving an established stream silently hung: no chunk,
-        no exception, forever. This wrapper bounds the wait for EVERY chunk
-        — including the FIRST (a hang before the first chunk is the same
-        failure mode) — and aborts with a retryable LLMTimeoutError so that
-        upstream retry logic (retry_with_backoff) engages instead of the
-        session hanging indefinitely. See microsoft/amplifier#339.
+        Quiet model prefill or reasoning does not prove transport failure.
+        The default therefore waits for a chunk, cancellation, or a real error.
         """
         iterator = stream.__aiter__()
         while True:
@@ -1201,6 +1214,20 @@ class VLLMProvider:
         Returns:
             ChatResponse with content blocks, tool calls, usage
         """
+        request_options = kwargs.pop("request_options", None)
+        if request_options is not None:
+            from collections.abc import Mapping
+
+            if not isinstance(request_options, Mapping):
+                raise ValueError("request_options must be a mapping or None")
+            kwargs = {**request_options, **kwargs}
+        # This controls output continuation, not elapsed time. Bounded callers
+        # need an incomplete result without repeated paid input. Never replace
+        # this with a deadline for healthy generation.
+        auto_continue = kwargs.get("auto_continue", self.auto_continue)
+        if type(auto_continue) is not bool:
+            raise ValueError("auto_continue must be a boolean")
+
         # VALIDATE AND REPAIR: Check for missing tool results (backup safety net)
         missing = self._find_missing_tool_results(request.messages)
 
@@ -1494,6 +1521,8 @@ class VLLMProvider:
 
         async def _do_complete():
             """Single API call attempt with SDK → kernel error translation."""
+            # Preserve explicit SDK transport overrides without duplicate kwargs.
+            sdk_params = {"timeout": self._sdk_timeout, **params}
             try:
                 if _use_streaming:
                     # -------------------------------------------------------
@@ -1512,7 +1541,7 @@ class VLLMProvider:
 
                     try:
                         async with asyncio.timeout(self.timeout):
-                            async with self.client.responses.stream(**params) as stream:
+                            async with self.client.responses.stream(**sdk_params) as stream:
                                 async for event in self._iter_with_idle_timeout(stream):
                                     if hooks_available:
                                         et = event.type
@@ -1630,7 +1659,8 @@ class VLLMProvider:
                     # Non-streaming fallback — preserved for backward compat and
                     # for callers that pass metadata={"stream": False}.
                     return await asyncio.wait_for(
-                        self.client.responses.create(**params), timeout=self.timeout
+                        self.client.responses.create(**sdk_params),
+                        timeout=self.timeout,
                     )
             except openai.RateLimitError as e:
                 retry_after = None
@@ -1812,11 +1842,13 @@ class VLLMProvider:
                 else []
             )
             final_response = response
+            billed_responses = [response]
             continuation_count = 0
 
             while (
                 hasattr(final_response, "status")
                 and final_response.status == "incomplete"
+                and kwargs.get("auto_continue", self.auto_continue)
                 and continuation_count < MAX_CONTINUATION_ATTEMPTS
             ):
                 continuation_count += 1
@@ -1881,6 +1913,7 @@ class VLLMProvider:
                 if self.extra_request_params:
                     continue_params.update(self.extra_request_params)
 
+                continue_sdk_params = {"timeout": self._sdk_timeout, **continue_params}
                 # Make continuation call (streaming or blocking)
                 try:
                     continue_start = time.time()
@@ -1900,7 +1933,7 @@ class VLLMProvider:
 
                         async with asyncio.timeout(self.timeout):
                             async with self.client.responses.stream(
-                                **continue_params
+                                **continue_sdk_params
                             ) as cont_stream:
                                 async for event in self._iter_with_idle_timeout(
                                     cont_stream
@@ -2003,12 +2036,14 @@ class VLLMProvider:
                     else:
                         # Non-streaming continuation fallback
                         final_response = await asyncio.wait_for(
-                            self.client.responses.create(**continue_params),
+                            self.client.responses.create(**continue_sdk_params),
                             timeout=self.timeout,
                         )
 
                     continue_elapsed = int((time.time() - continue_start) * 1000)
                     elapsed_ms += continue_elapsed
+
+                    billed_responses.append(final_response)
 
                     # Accumulate output from continuation
                     if (
@@ -2046,14 +2081,8 @@ class VLLMProvider:
                 # Use existing conversion for normal (non-continued) responses
                 chat_response = self._convert_to_chat_response(response)
 
-            # Surface silent input truncation (truncation="auto" only -- the
-            # default is "disabled", which fails loud instead). Reuses the
-            # SAME canonical chat_response.usage.input_tokens the llm:response
-            # event below reports -- no separate/parallel usage parsing. Runs
-            # exactly once here regardless of how many continuation rounds
-            # preceded this point, so at most one warning is logged per
-            # response. See _truncation.py for the detection rule and its
-            # evidence-based margin.
+            # Context pressure is a measurement of ONE request, not the sum of
+            # repeated billed inputs across continuations.
             self._maybe_warn_truncated_input(
                 model=params["model"],
                 truncation=params.get("truncation"),
@@ -2062,6 +2091,28 @@ class VLLMProvider:
                 ),
                 requested_max_output_tokens=params.get("max_output_tokens"),
             )
+
+            if len(billed_responses) > 1:
+                # Each continuation resends input. Report every measured exchange,
+                # keeping cache/reasoning counters as subsets rather than adding
+                # them to input/output a second time. Missing counters stay unknown.
+                measurements = [usage_from_response(r) for r in billed_responses]
+                fields = (
+                    "input_tokens",
+                    "output_tokens",
+                    "total_tokens",
+                    "reasoning_tokens",
+                    "cache_read_tokens",
+                    "cache_write_tokens",
+                )
+                totals = {}
+                for field in fields:
+                    values = [getattr(u, field, None) for u in measurements]
+                    if all(type(v) is int for v in values):
+                        totals[field] = sum(values)
+                    elif field not in ("input_tokens", "output_tokens", "total_tokens"):
+                        totals[field] = None
+                chat_response.usage = chat_response.usage.model_copy(update=totals)
 
             # Emit llm:response event using canonical usage fields from chat_response
             if self.coordinator and hasattr(self.coordinator, "hooks"):
@@ -2520,6 +2571,9 @@ class VLLMProvider:
                         # NOTE: Do NOT add reasoning to text_accumulator - it's internal process, not response content
 
                 elif block_type in {"tool_call", "function_call"}:
+                    validate_function_completion(
+                        block, getattr(response, "status", None)
+                    )
                     # Responses item IDs and invocation IDs are distinct.
                     # Function results must correlate with call_id.
                     tool_id = getattr(block, "call_id", "") or getattr(block, "id", "")
@@ -2601,6 +2655,9 @@ class VLLMProvider:
                         # NOTE: Do NOT add reasoning to text_accumulator - it's internal process, not response content
 
                 elif block_type in {"tool_call", "function_call"}:
+                    validate_function_completion(
+                        block, getattr(response, "status", None)
+                    )
                     tool_id = block.get("call_id") or block.get("id", "")
                     tool_name = block.get("name", "")
                     tool_input = block.get("input")
@@ -2711,7 +2768,11 @@ class VLLMProvider:
             content=content_blocks,
             tool_calls=tool_calls if tool_calls else None,
             usage=usage,
-            finish_reason=getattr(response, "finish_reason", None),
+            finish_reason=(
+                "length"
+                if getattr(response, "status", None) == "incomplete"
+                else getattr(response, "finish_reason", None)
+            ),
             content_blocks=event_blocks if event_blocks else None,
             text=combined_text or None,
             metadata=metadata if metadata else None,

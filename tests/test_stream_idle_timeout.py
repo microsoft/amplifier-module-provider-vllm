@@ -310,13 +310,10 @@ def test_default_comes_from_constants(monkeypatch):
     assert provider.stream_idle_timeout == DEFAULT_STREAM_IDLE_TIMEOUT
 
 
-def test_default_is_generous_for_long_prefill():
-    """Long time-to-first-token on 60-90k-token prompts is legitimate (minutes).
+def test_default_waits_for_prefill_or_reasoning_completion():
+    """A quiet stream alone does not establish transport failure."""
+    assert DEFAULT_STREAM_IDLE_TIMEOUT is None
 
-    The default must be minutes-scale — big enough to never false-positive on
-    a healthy long prefill, small enough to bound a silent hang.
-    """
-    assert 120.0 <= DEFAULT_STREAM_IDLE_TIMEOUT <= 600.0
 
 
 def test_config_overrides_default(monkeypatch):
@@ -357,3 +354,8 @@ def test_config_fields_include_stream_idle_timeout():
     provider2 = _bare_provider()
     provider2.config = {"stream_idle_timeout": "45.0"}
     # settings-only: still overridable directly, just not via the wizard
+
+
+def test_explicit_null_disables_environment_idle_limit(monkeypatch):
+    monkeypatch.setenv("VLLM_STREAM_IDLE_TIMEOUT", "45")
+    assert _bare_provider({"stream_idle_timeout": None}).stream_idle_timeout is None

@@ -113,7 +113,7 @@ class TestProviderConfigCoercionIntegration:
 
     def test_invalid_numeric_string_defaults_instead_of_crashing(self):
         provider = _provider(timeout="not-a-number")
-        assert provider.timeout == 600.0
+        assert provider.timeout is None
 
     def test_extra_request_params_stored(self):
         provider = _provider(extra_request_params={"top_p": 0.9})

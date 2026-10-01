@@ -16,7 +16,7 @@ METADATA_CONTINUATION_COUNT = "vllm:continuation_count"
 DEFAULT_MODEL = "openai/gpt-oss-20b"  # Default model for vLLM
 DEFAULT_MAX_TOKENS = 4096
 DEFAULT_REASONING_SUMMARY = "detailed"
-DEFAULT_TIMEOUT = 600.0  # 10 minutes
+DEFAULT_TIMEOUT = None  # Explicit caller deadlines only
 
 # BEHAVIOR CHANGE (see README "Truncation" section): this default was "auto"
 # prior to this change. With truncation="auto", vLLM's Responses API silently
@@ -54,20 +54,9 @@ DEFAULT_TIMEOUT = 600.0  # 10 minutes
 # rather than request parameters.
 DEFAULT_TRUNCATION = "disabled"
 
-# Inter-chunk idle timeout for streaming responses (seconds).
-#
-# Bounds the wait for EVERY chunk on an established stream — including the
-# FIRST one (a hang before the first chunk is the same failure mode).
-# Remote vLLM endpoints behind hosted-GPU HTTPS proxies (RunPod et al.)
-# routinely drop quiet connections without FIN, which previously left a
-# stream hanging silently forever (observed: ~8.7 hours mid-turn).
-#
-# Why 300s and not something aggressive like 30s: this endpoint class
-# legitimately has long time-to-first-token during prefill of 60-90k-token
-# prompts (minutes, not seconds). The default must never false-positive on
-# a healthy long prefill, while still guaranteeing a hung stream surfaces
-# as a retryable error instead of hanging forever.
-DEFAULT_STREAM_IDLE_TIMEOUT = 300.0  # 5 minutes
+# Silence during prefill or thinking is not evidence of failure. Operators may
+# opt into an inter-chunk idle deadline with config or VLLM_STREAM_IDLE_TIMEOUT.
+DEFAULT_STREAM_IDLE_TIMEOUT = None
 
 # Ceiling on how long close() waits for the HTTP client to shut down. An
 # httpx transport with a wedged connection can leave AsyncOpenAI.close()
