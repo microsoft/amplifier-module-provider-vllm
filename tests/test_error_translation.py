@@ -7,9 +7,9 @@ error types with correct attributes (provider, status_code, retryable, __cause__
 import asyncio
 from unittest.mock import AsyncMock
 
-import httpx
 import openai
 import pytest
+from tests.sdk_transport import httpx
 from amplifier_core import llm_errors as kernel_errors
 from amplifier_core.message_models import ChatRequest, Message
 

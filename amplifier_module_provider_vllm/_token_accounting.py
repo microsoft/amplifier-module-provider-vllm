@@ -354,7 +354,10 @@ def inject_usage(response: Any, input_tokens: int, output_tokens: int) -> Any:
     # Create proper Pydantic models (not dicts)
     usage = ResponseUsage(
         input_tokens=input_tokens,
-        input_tokens_details=InputTokensDetails(cached_tokens=0),
+        # Newer SDKs require this field. Older SDK models retain it as an
+        # allowed extra; supplying both zero counts keeps the usage validated
+        # without version checks or bypassing Pydantic construction.
+        input_tokens_details=InputTokensDetails(cached_tokens=0, cache_write_tokens=0),
         output_tokens=output_tokens,
         output_tokens_details=OutputTokensDetails(reasoning_tokens=0),
         total_tokens=total_tokens,
