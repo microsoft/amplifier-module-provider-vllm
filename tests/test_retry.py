@@ -12,8 +12,8 @@ from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock, patch
 
-import httpx
 import openai
+from tests.sdk_transport import httpx
 from amplifier_core import ModuleCoordinator
 from amplifier_core import llm_errors as kernel_errors
 from amplifier_core.message_models import ChatRequest, Message

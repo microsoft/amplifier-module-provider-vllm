@@ -116,7 +116,8 @@ def convert_response_with_accumulated_output(
                     # NOTE: Do NOT add reasoning to text_accumulator - it's internal process, not response content
 
             elif block_type in {"tool_call", "function_call"}:
-                tool_id = getattr(block, "id", "") or getattr(block, "call_id", "")
+                # Keep the invocation ID, not the SDK's output-item ID.
+                tool_id = getattr(block, "call_id", "") or getattr(block, "id", "")
                 tool_name = getattr(block, "name", "")
                 tool_input = getattr(block, "input", None)
                 if tool_input is None and hasattr(block, "arguments"):
@@ -199,7 +200,7 @@ def convert_response_with_accumulated_output(
                     # NOTE: Do NOT add reasoning to text_accumulator - it's internal process, not response content
 
             elif block_type in {"tool_call", "function_call"}:
-                tool_id = block.get("id") or block.get("call_id", "")
+                tool_id = block.get("call_id") or block.get("id", "")
                 tool_name = block.get("name", "")
                 tool_input = block.get("input")
                 if tool_input is None:

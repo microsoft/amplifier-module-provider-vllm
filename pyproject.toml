@@ -9,15 +9,10 @@ authors = [
     { name = "Microsoft MADE:Explorations Team" },
 ]
 dependencies = [
-    # Upper bound intentional: openai SDK 2.54+ (including all 3.x) changed the
-    # Responses API usage/InputTokensDetails shape (added a required
-    # cache_write_tokens field) and dropped the httpx dependency in favor of
-    # httpx2. This suite's fixtures assume the pre-2.54 shape, so 2.54+ fails
-    # 38 tests with pydantic ValidationError: InputTokensDetails.cache_write_tokens
-    # Field required. Revisit this bound only after refreshing the affected
-    # fixtures (test_verbosity_collapse / test_reasoning_effort / test_tool_repair
-    # / test_retry) to match the newer shape.
-    "openai>=1.0.0,<2.9",
+    # Usage injection supports the required cache_write_tokens field in newer
+    # SDKs. CI covers retained 2.x clients and the 3.x SDK's own HTTP transport.
+    # Requalify before admitting another major SDK.
+    "openai>=2.8.1,<4",
     "openai-harmony>=0.0.8",
 ]
 
@@ -44,6 +39,7 @@ allow-direct-references = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "--import-mode=importlib"
+pythonpath = ["."]
 asyncio_mode = "strict"
 markers = [
     "live: requires a reachable vLLM/OpenAI-compatible server; deselected in CI via `-m \"not live\"`",
