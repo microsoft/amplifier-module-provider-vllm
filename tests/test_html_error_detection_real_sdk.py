@@ -13,20 +13,20 @@ These tests build the error the way the SDK actually does -- via
 -- so they fail if anyone reintroduces the body-is-None assumption.
 """
 
-import httpx
 import openai
+from tests.sdk_transport import httpx
 
 from amplifier_module_provider_vllm import VLLMProvider
 
 
 def _sdk_error(status: int, content_type: str, body: bytes) -> openai.APIStatusError:
     """An APIStatusError built through the SDK's own construction path."""
-    client = openai.OpenAI(api_key="x", base_url="https://x/v1")
     request = httpx.Request("POST", "https://x-8000.proxy.example.net/v1/responses")
     response = httpx.Response(
         status, headers={"content-type": content_type}, content=body, request=request
     )
-    return client._make_status_error_from_response(response)
+    with openai.OpenAI(api_key="x", base_url="https://x/v1") as client:
+        return client._make_status_error_from_response(response)
 
 
 class TestBodyIsRawStringNotNone:

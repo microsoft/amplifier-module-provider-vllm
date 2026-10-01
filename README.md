@@ -468,6 +468,29 @@ make check
 
 ## Testing
 
+Run the offline suite with `uv run pytest -q -m "not live"`. CI covers OpenAI
+SDK 2.8.1, 2.9.0, 2.53.0, and 3.22.1 on Python 3.11 and 3.12. The default
+lock targets the latest qualified SDK; retained 2.x environments remain covered.
+Real SDK JSON and SSE parsing tests use an in-memory HTTP transport, not paid
+model calls. The live model-list check remains explicitly deselected until a
+reachable vLLM endpoint is supplied.
+
+Token accounting constructs validated SDK usage records with both cached-read
+and cache-write counts. Newer SDKs require the cache-write field even when vLLM
+does not report it. If a future usage-schema change prevents construction, the
+completed answer and original usage are retained with an explicit warning that
+corrected accounting is unavailable; a successful answer is not discarded.
+Error fixtures use the installed SDK's HTTP package (`httpx`
+on 2.x, `httpx2` on 3.x), including when both are installed. Do not restore the
+old `<2.9` cap to work around test fixtures: it conflicts with providers that
+require native Responses compaction. A future major SDK requires requalification.
+The supported minimum is the lowest qualified SDK, 2.8.1. CI names each SDK
+case and checks its effective version before tests. Test imports explicitly
+include the checkout root rather than depending on an editable installation.
+Responses tool invocation IDs are kept distinct from output-item IDs, including
+the second SDK request carrying a tool result. This aligns correlation with the
+Responses contract; it does not establish how every live vLLM server validates IDs.
+
 See `ai_working/vllm-investigation/` for comprehensive test scripts:
 
 - `test_provider_simple.py` - Basic provider functionality test

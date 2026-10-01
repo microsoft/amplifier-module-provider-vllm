@@ -351,14 +351,27 @@ def inject_usage(response: Any, input_tokens: int, output_tokens: int) -> Any:
 
     total_tokens = input_tokens + output_tokens
 
-    # Create proper Pydantic models (not dicts)
-    usage = ResponseUsage(
-        input_tokens=input_tokens,
-        input_tokens_details=InputTokensDetails(cached_tokens=0),
-        output_tokens=output_tokens,
-        output_tokens_details=OutputTokensDetails(reasoning_tokens=0),
-        total_tokens=total_tokens,
-    )
+    # Create proper Pydantic models (not dicts). A future schema change must
+    # not discard a completed model answer; preserve the original usage and
+    # warn explicitly when corrected token accounting cannot be constructed.
+    try:
+        usage = ResponseUsage(
+            input_tokens=input_tokens,
+            # Newer SDKs require this field. Older SDK models retain it as an
+            # allowed extra; supplying both zero counts keeps usage validated.
+            input_tokens_details=InputTokensDetails(cached_tokens=0, cache_write_tokens=0),
+            output_tokens=output_tokens,
+            output_tokens_details=OutputTokensDetails(reasoning_tokens=0),
+            total_tokens=total_tokens,
+        )
+    except (TypeError, ValueError) as error:
+        logger.warning(
+            "[TOKEN_ACCOUNTING] SDK usage construction failed (%s); "
+            "returning the completed response with its original usage. "
+            "Corrected token accounting is unavailable.",
+            type(error).__name__,
+        )
+        return response
 
     # Approach 1: Direct mutation (if supported)
     try:
@@ -383,7 +396,7 @@ def inject_usage(response: Any, input_tokens: int, output_tokens: int) -> Any:
     except Exception as e:
         logger.warning(
             f"[TOKEN_ACCOUNTING] Failed to inject usage (both approaches): {e}. "
-            f"Returning response with original (zero) usage values."
+            f"Returning response with original usage values."
         )
         return response
 

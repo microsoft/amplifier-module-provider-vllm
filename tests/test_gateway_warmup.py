@@ -12,9 +12,9 @@ from a proxy, and retrying it for a minute before reporting "warming up" sends
 the operator after a fix that will never work.
 """
 
-import httpx
 import openai
 import pytest
+from tests.sdk_transport import httpx
 
 from amplifier_module_provider_vllm import VLLMProvider
 
