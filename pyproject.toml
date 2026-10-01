@@ -12,7 +12,7 @@ dependencies = [
     # Usage injection supports the required cache_write_tokens field in newer
     # SDKs. CI covers retained 2.x clients and the 3.x SDK's own HTTP transport.
     # Requalify before admitting another major SDK.
-    "openai>=1.0.0,<4",
+    "openai>=2.8.1,<4",
     "openai-harmony>=0.0.8",
 ]
 
@@ -39,6 +39,7 @@ allow-direct-references = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "--import-mode=importlib"
+pythonpath = ["."]
 asyncio_mode = "strict"
 markers = [
     "live: requires a reachable vLLM/OpenAI-compatible server; deselected in CI via `-m \"not live\"`",

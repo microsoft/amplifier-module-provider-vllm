@@ -46,7 +46,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "openai", specifier = ">=1.0.0,<4" },
+    { name = "openai", specifier = ">=2.8.1,<4" },
     { name = "openai-harmony", specifier = ">=0.0.8" },
 ]
 

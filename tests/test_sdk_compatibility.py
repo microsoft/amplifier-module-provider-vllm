@@ -55,6 +55,22 @@ def test_inject_usage_constructs_validated_sdk_models(immutable):
     assert usage.input_tokens_details.cache_write_tokens == 0
 
 
+@pytest.mark.parametrize("error_type", [TypeError, ValueError])
+def test_usage_schema_failure_keeps_completed_response_and_warns(monkeypatch, caplog, error_type):
+    from openai.types.responses import response_usage
+
+    def incompatible_schema(**kwargs):
+        raise error_type("Future SDK requires another usage field")
+
+    monkeypatch.setattr(response_usage, "InputTokensDetails", incompatible_schema)
+    original_usage = SimpleNamespace(input_tokens=0, output_tokens=0)
+    response = SimpleNamespace(usage=original_usage, output="completed answer")
+    assert accounting.inject_usage(response, 10, 5) is response
+    assert response.usage is original_usage
+    assert response.output == "completed answer"
+    assert "Corrected token accounting is unavailable" in caplog.text
+
+
 @pytest.mark.parametrize("streaming", [False, True])
 @pytest.mark.parametrize("model", ["meta-llama/Llama-3-8B", "openai/gpt-oss-20b"])
 @pytest.mark.asyncio
@@ -154,3 +170,40 @@ async def test_real_sdk_parses_tool_call_without_losing_arguments(streaming):
     ])
     assert next(item["call_id"] for item in followup if item["type"] == "function_call") == "call_compat"
     assert next(item["call_id"] for item in followup if item["type"] == "function_call_output") == "call_compat"
+
+
+@pytest.mark.asyncio
+async def test_real_sdk_sends_second_tool_result_request_with_invocation_id():
+    model = "meta-llama/Llama-3-8B"
+    tool_body = payload(model)
+    tool_body["output"] = [{"id": "fc_compat", "type": "function_call",
+                           "call_id": "call_compat", "name": "lookup",
+                           "arguments": '{"key":"kept"}', "status": "completed"}]
+    requests = []
+
+    async def handler(request):
+        sent = json.loads(request.content)
+        requests.append(sent)
+        if len(requests) == 1:
+            return httpx.Response(200, json=tool_body)
+        calls = [item for item in sent["input"] if item.get("type") == "function_call"]
+        results = [item for item in sent["input"] if item.get("type") == "function_call_output"]
+        assert calls[0]["call_id"] == results[0]["call_id"] == "call_compat"
+        assert json.loads(calls[0]["arguments"]) == {"key": "kept"}
+        assert results[0]["output"] == "found"
+        return httpx.Response(200, json=payload(model))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as transport:
+        async with openai.AsyncOpenAI(api_key="fixture", base_url="http://vllm.invalid/v1",
+                                     http_client=transport, max_retries=0) as client:
+            provider = VLLMProvider(client=client, config={"default_model": model,
+                                    "use_streaming": False, "max_retries": 0})
+            user = Message(role="user", content="Hello")
+            first = await provider.complete(ChatRequest(messages=[user]))
+            tool = next(block for block in first.content if getattr(block, "type", None) == "tool_call")
+            second = await provider.complete(ChatRequest(messages=[
+                user, Message(role="assistant", content=first.content),
+                Message(role="tool", content="found", tool_call_id=tool.id),
+            ]))
+    assert len(requests) == 2
+    assert any(getattr(block, "text", None) == "SDK-compatible answer" for block in second.content)

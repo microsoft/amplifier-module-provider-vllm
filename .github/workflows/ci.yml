@@ -7,7 +7,7 @@ on:
 
 jobs:
   test:
-    name: pytest (py${{ matrix.python-version }})
+    name: pytest (py${{ matrix.python-version }}, openai${{ matrix.openai-version }})
     runs-on: ubuntu-latest
     # A hang must fail LOUDLY and fast, not sit burning runner time until the
     # 6h default -- a job stuck at "in_progress" reads as "not done yet"
@@ -33,6 +33,9 @@ jobs:
         run: |
           uv lock --upgrade-package "openai==${{ matrix.openai-version }}"
           uv sync --locked --all-extras --dev
+
+      - name: Verify effective SDK version
+        run: uv run --no-sync python -c "import openai; assert openai.__version__ == '${{ matrix.openai-version }}', openai.__version__; print('Qualified SDK', openai.__version__)"
 
       - name: Run test suite
         # Deselects tests marked `live`: the inherited
