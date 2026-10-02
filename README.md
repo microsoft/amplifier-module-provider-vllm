@@ -523,11 +523,19 @@ Any use of third-party trademarks or logos are subject to those third-party's po
 
 ### Bounded output without a completion deadline
 
-`auto_continue` defaults to `true`, preserving normal continuation of truncated
-responses. Set it to `false` in provider configuration or pass
-`request_options={"auto_continue": False}` to `complete()` for a bounded output
-operation. The per-call option takes precedence and never changes the mounted
-provider. The option is consumed locally and is not sent to the API. An incomplete
+`auto_continue` is an optional settings-only provider configuration key, not a
+setup prompt. It defaults to `true` when omitted, preserving normal continuation
+of truncated responses. To disable continuation, set it explicitly in settings:
+
+```yaml
+config:
+  auto_continue: false
+```
+
+For a single bounded output operation, pass
+`request_options={"auto_continue": False}` to `complete()`. The per-call option
+takes precedence and never changes the mounted provider. The option is consumed
+locally and is not sent to the API. An incomplete
 response retains its partial content and usage, reports `finish_reason="length"`,
 and is not retried with a larger output budget. Consumers must not treat that
 partial response as a complete summary. The provider advertises this optional
