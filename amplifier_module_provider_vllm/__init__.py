@@ -711,14 +711,6 @@ class VLLMProvider:
                 "max_output_tokens": self.max_output_tokens,
             },
             config_fields=[
-                ConfigField(
-                    id="auto_continue",
-                    display_name="Continue truncated responses",
-                    field_type="boolean",
-                    prompt="Automatically continue responses that reach the output limit",
-                    default="true",
-                    required=False,
-                ),
                 # base_url is the single source of truth for local-vs-remote.
                 # Localhost URLs are treated as local; any other URL is treated
                 # as remote (capability-tagged accordingly). To run BOTH a local
