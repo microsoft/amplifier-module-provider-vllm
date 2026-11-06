@@ -244,19 +244,19 @@ class TestListModelsDiscovery:
         )
         models = await provider.list_models()
 
-        assert models[0].context_window == 100000
+        assert models[0].context_window == 262144
+        assert provider._resolve_limits("qwen3-coder-30b")[0] == 100000
 
     @pytest.mark.asyncio
-    async def test_no_card_field_no_config_falls_back_to_default(self):
-        """5. Regression guard: nothing discovered, nothing configured ->
-        DEFAULT_CONTEXT_WINDOW (128000), same as pre-discovery behavior."""
+    async def test_no_card_field_is_unknown_listing_but_inference_default_retained(self):
         provider = VLLMProvider(
             client=_mock_client(_model_card("plain-model")),
             config={},
         )
         models = await provider.list_models()
 
-        assert models[0].context_window == DEFAULT_CONTEXT_WINDOW == 128000
+        assert models[0].context_window == 0
+        assert provider._resolve_limits("plain-model")[0] == DEFAULT_CONTEXT_WINDOW == 128000
 
     @pytest.mark.asyncio
     async def test_max_output_tokens_leaves_input_headroom_on_small_window(self):
@@ -272,7 +272,8 @@ class TestListModelsDiscovery:
         models = await provider.list_models()
 
         assert models[0].context_window == 8192
-        assert models[0].max_output_tokens == 4096  # capped from the DEFAULT (32768)
+        assert models[0].max_output_tokens == 0  # not reported in this card
+        assert provider._resolve_limits("small-model")[1] == 4096
         # context-simple's budget formula must still leave usable input room.
         budget = 8192 - models[0].max_output_tokens // 2 - 4096
         assert budget > 0
@@ -287,7 +288,8 @@ class TestListModelsDiscovery:
         )
         models = await provider.list_models()
 
-        assert models[0].max_output_tokens == 32768  # the DEFAULT, unchanged
+        assert models[0].max_output_tokens == 0
+        assert provider._resolve_limits("glm-5.2")[1] == 32768
 
 
 # ---------------------------------------------------------------------------
@@ -318,7 +320,8 @@ class TestMalformedValuesDegradeCleanly:
         )
         models = await provider.list_models()
 
-        assert models[0].context_window == DEFAULT_CONTEXT_WINDOW
+        assert models[0].context_window == 0
+        assert provider._resolve_limits("weird-model")[0] == DEFAULT_CONTEXT_WINDOW
 
     def test_extract_max_model_len_handles_missing_attributes(self):
         """Card objects with neither max_model_len nor model_extra degrade

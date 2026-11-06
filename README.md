@@ -49,6 +49,24 @@ sudo systemctl start vllm
 
 ## Configuration
 
+### Model listing
+
+`list_models(*, filters=None)` fetches all current served IDs from the bound
+client's `/v1/models`, including custom aliases. All are recommended by default,
+with no vendor prefix or family suppression. Every page is consumed; empty success
+stays empty and typed sanitized failures never become cached inventory.
+
+`config.model_filters` snapshots `include`, `exclude` and `hide_dated`.
+Per-call mappings replace it: `{}` is unfiltered, `include: []` includes none,
+and exclude wins. Globs are case-insensitive and OS-independent; IDs stay exact.
+`hide_dated` only suppresses YYYY-MM-DD snapshots when their undated alias is
+selected. `get_model_list_info()` reports the v1 schema and `source: provider-api`.
+
+Listing reports only limits present in current model cards; missing values are
+zero (unknown), and capabilities are not inferred. Existing inference limit
+caches, configured budget clamping, explicit model selection and request parameters
+remain separate and unchanged.
+
 ### Minimal Configuration
 
 ```yaml

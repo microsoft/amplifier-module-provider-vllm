@@ -16,6 +16,7 @@ import os
 import time
 import uuid
 from collections import defaultdict
+from collections.abc import Mapping
 from decimal import Decimal
 from typing import Any
 from urllib.parse import urlparse
@@ -53,6 +54,7 @@ from ._constants import METADATA_INCOMPLETE_REASON
 from ._constants import METADATA_RESPONSE_ID
 from ._constants import METADATA_STATUS
 from ._cost import compute_cost
+from ._model_listing import ModelFilters, listing_info
 from ._response_handling import usage_from_response, validate_function_completion
 from ._response_handling import convert_response_with_accumulated_output
 from ._token_accounting import apply_token_accounting
@@ -92,6 +94,7 @@ _KNOWN_CONFIG_KEYS = frozenset(
         "instance_id",
         "extra_request_params",
         "close_timeout",
+        "model_filters",
     }
 )
 
@@ -415,6 +418,7 @@ class VLLMProvider:
         """
         self._client: AsyncOpenAI | None = client  # Lazy init if None
         self.config = config or {}
+        self._model_filters = ModelFilters.parse(self.config.get("model_filters", {}))
         self.coordinator = coordinator
         self.base_url = base_url
         self.api_key = api_key
@@ -789,7 +793,12 @@ class VLLMProvider:
             defaults={"temperature": None, "max_tokens": 16384},
         )
 
-    async def list_models(self) -> list[ModelInfo]:
+    def get_model_list_info(self) -> dict[str, Any]:
+        return listing_info("provider-api", self._model_filters)
+
+    async def list_models(
+        self, *, filters: Mapping[str, object] | None = None
+    ) -> list[ModelInfo]:
         """
         List available models from vLLM server.
 
@@ -804,11 +813,41 @@ class VLLMProvider:
         of one flat instance-level number. Servers that do not report the
         field fall back to the configured value or DEFAULT_CONTEXT_WINDOW.
         """
-        # vLLM supports OpenAI-compatible /v1/models endpoint
-        # Let exceptions propagate - connection errors should be shown to user
-        models_response = await self.client.models.list()
+        policy = self._model_filters if filters is None else ModelFilters.parse(filters)
+        # Keep the existing bound client, credentials and headers; no SDK clone.
+        cards = []
+        try:
+            page = await self.client.models.list()
+            while True:
+                if not isinstance(page.data, list):
+                    raise ValueError("vLLM catalog requires a data list")
+                for model in page.data:
+                    if not isinstance(model.id, str) or not model.id.strip():
+                        raise ValueError("vLLM catalog requires nonblank string IDs")
+                    cards.append(model)
+                if not hasattr(page, "has_next_page") or not page.has_next_page():
+                    break
+                page = await page.get_next_page()
+        except Exception as exc:
+            if isinstance(exc, openai.AuthenticationError):
+                error_type = kernel_errors.AuthenticationError
+            elif isinstance(exc, openai.PermissionDeniedError):
+                error_type = kernel_errors.AccessDeniedError
+            elif isinstance(exc, openai.RateLimitError):
+                error_type = kernel_errors.RateLimitError
+            elif isinstance(exc, openai.APITimeoutError):
+                error_type = kernel_errors.LLMTimeoutError
+            elif isinstance(exc, (openai.APIConnectionError, openai.InternalServerError)):
+                error_type = kernel_errors.ProviderUnavailableError
+            else:
+                error_type = kernel_errors.LLMError
+            raise error_type(
+                "vLLM model listing failed", provider=self.name,
+                status_code=getattr(exc, "status_code", None),
+            ) from None
+        selected = set(policy.select([model.id for model in cards]))
         models = []
-        for model in models_response.data:
+        for model in cards:
             discovered, discovered_out, source = self._discover_card_limits(model)
             if discovered is not None:
                 # Name the field the number came from. The bug this
@@ -825,23 +864,22 @@ class VLLMProvider:
                 self._discovered_limits[model.id] = discovered
             if discovered_out is not None:
                 self._discovered_output_limits[model.id] = discovered_out
-            context_window, max_output_tokens = self._resolve_limits(model.id)
+            if model.id not in selected:
+                continue
+            # Listing reports only current card evidence, not inference defaults
+            # or cached values from a previous catalog. Keep inference caches above.
+            context_window = discovered or 0
+            max_output_tokens = discovered_out or 0
             models.append(
                 ModelInfo(
                     id=model.id,
                     display_name=model.id,
                     context_window=context_window,
                     max_output_tokens=max_output_tokens,
-                    capabilities=[
-                        "tools",
-                        "streaming",
-                        "reasoning",
-                        "remote" if self._is_remote_cached else "local",
-                    ],
-                    defaults={"temperature": None, "max_tokens": 16384},
+                    capabilities=[],
                 )
             )
-        return models
+        return sorted({model.id: model for model in models}.values(), key=lambda model: model.id)
 
     async def _iter_with_idle_timeout(self, stream):
         """Yield events with an optional operator-configured idle deadline.
