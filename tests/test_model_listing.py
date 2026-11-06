@@ -81,7 +81,8 @@ async def test_exact_ids_filters_binding_and_inference():
                 model="hidden-exact-alias",
                 max_output_tokens=100,
                 messages=[Message(role="user", content="test")],
-            )
+            ),
+            model="hidden-exact-alias",
         )
     finally:
         await p.close()

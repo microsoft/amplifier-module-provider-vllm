@@ -361,6 +361,8 @@ class TestClampWarning:
 
         with caplog.at_level(logging.WARNING):
             models = await provider.list_models()
+            # Budget clamping remains an inference operation, not catalog evidence.
+            provider._resolve_limits("glm-5.2")
 
         assert models[0].context_window == 131072
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
