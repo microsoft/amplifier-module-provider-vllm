@@ -811,7 +811,8 @@ class VLLMProvider:
         model's advertised limits, so an endpoint serving several models
         with different context lengths reports each one accurately instead
         of one flat instance-level number. Servers that do not report the
-        field fall back to the configured value or DEFAULT_CONTEXT_WINDOW.
+        field return unknown (zero) listing limits. Inference's separate
+        configured/default budget resolution is unchanged.
         """
         policy = self._model_filters if filters is None else ModelFilters.parse(filters)
         # Keep the existing bound client, credentials and headers; no SDK clone.

@@ -64,7 +64,7 @@ class TestConfigOverride:
         assert defaults["max_output_tokens"] == 65536
 
     @pytest.mark.asyncio
-    async def test_list_models_reflects_config(self):
+    async def test_list_models_does_not_mislabel_config_as_current_card_limits(self):
         provider = VLLMProvider(
             client=_mock_client(),
             config={"context_window": 200000, "max_output_tokens": 65536},
@@ -72,8 +72,10 @@ class TestConfigOverride:
         models = await provider.list_models()
 
         assert len(models) == 1
-        assert models[0].context_window == 200000
-        assert models[0].max_output_tokens == 65536
+        assert models[0].context_window == 0
+        assert models[0].max_output_tokens == 0
+        assert provider.get_model_info().context_window == 200000
+        assert provider.get_model_info().max_output_tokens == 65536
 
     def test_string_values_coerced_to_int(self):
         """Config values arriving as strings (e.g. from env/YAML) coerce to int."""
