@@ -108,13 +108,65 @@ providers:
       priority: 100                         # Provider selection priority
 
       # Debug
-      raw: false                            # Attach exact request params to llm:request
+      raw: false                            # Attach redacted request params to llm:request
 ```
 
 `debug`, `raw_debug`, and `debug_truncate_length` are ghost keys from an
 older version of this README -- they were never read by this provider.
-Use `raw: true` to attach the exact request params sent to the server on
-the `llm:request` event.
+Use `raw: true` to attach request params on the `llm:request` event, with
+secrets and structured image payloads/URLs omitted from the diagnostic copy.
+
+### Image inputs (endpoint-dependent)
+
+Core `ImageBlock` sources support `{"type": "base64", "media_type": "image/png",
+"data": "..."}` and `{"type": "url", "url": "https://..."}` (including base64
+`data:image/...` URLs). The provider preserves image bytes, order and adjacent
+text as native Responses `input_image`/`input_text` parts. It does not resize,
+fetch URLs, decode image formats or guess vision capability from model names.
+The server fetches HTTP(S) URLs, subject to its network/domain configuration.
+Local file paths, OpenAI file IDs and malformed sources become explicit
+`[Image unavailable: ...]` text parts; later text is retained.
+
+| Input | Provider wire behavior | Server qualification needed |
+| --- | --- | --- |
+| User image or mixed text/images | Native ordered message content parts | Generic multimodal Responses path, vision model and chat template |
+| Tool image with `tool_call_id` | Native `function_call_output.output` parts, same call ID/slot | Server SDK supporting list outputs, multimodal parser and tool-aware vision template |
+| Image tool result without call ID | Non-retryable error, no fabricated user turn | Restore original invocation identity upstream |
+| Text-only history | Existing serialization unchanged | Existing endpoint requirements |
+| Harmony/GPT-OSS image processing | Not established by this provider | Inspected Harmony path is text-only; no image-support claim |
+
+Actual vLLM source evidence (not just OpenAI API documentation):
+[v0.17.0 Responses serving](https://github.com/vllm-project/vllm/blob/v0.17.0/vllm/entrypoints/openai/responses/serving.py)
+routes generic input through
+[Responses conversion](https://github.com/vllm-project/vllm/blob/v0.17.0/vllm/entrypoints/openai/responses/utils.py)
+and the shared
+[`input_image` parser](https://github.com/vllm-project/vllm/blob/v0.17.0/vllm/entrypoints/chat_utils.py).
+The same generic path exists in
+[v0.12.0](https://github.com/vllm-project/vllm/blob/v0.12.0/vllm/entrypoints/openai/serving_responses.py).
+This is not a minimum-version guarantee: even
+[v0.17.0's requirements](https://github.com/vllm-project/vllm/blob/v0.17.0/requirements/common.txt)
+permit older server-side OpenAI SDK schemas that accept **string-only** function
+outputs. Client SDK acceptance alone does not qualify the server installation.
+Unsupported servers return their normal errors; the provider never retries by
+moving images to a fake user or silently stripping them. The bound custom
+`base_url` remains the destination, not the global OpenAI service.
+
+There is no image-aware preflight count/refit API in this provider. Its local
+Harmony text estimator cannot count image tokens: image requests preserve server
+usage instead of replacing it with a purported exact text-only count, with an
+explicit warning when that correction is unavailable. Missing/zero server usage
+does not establish a zero-cost image request. Context/overflow and continuation
+behavior remain unchanged; native parts are retained during continuation.
+
+Offline tests use Core objects and the installed OpenAI SDK's in-memory HTTP
+transport. They establish serialization, diagnostic redaction and history
+preservation, **not live server/model vision acceptance**. Qualify your exact
+server SDK, served model, chat template and multimodal limits separately.
+Native image parts are covered on JSON and completed-SSE requests; the automatic
+continuation image regression is JSON-only. A supplemental OpenAI SDK 3.22.1
+stream test with a terminal `response.incomplete` event failed in the SDK's
+`get_final_response()` (which requires `response.completed`); this patch does
+not claim to repair that separate incomplete-stream boundary.
 
 ### Stream idle timeout
 
@@ -372,11 +424,11 @@ The vLLM provider uses the **Responses API** (`/v1/responses`) which provides:
 
 ## Debugging
 
-Enable `raw` to attach the exact request params to the `llm:request` event:
+Enable `raw` to attach redacted request params to the `llm:request` event:
 
 ```yaml
 config:
-  raw: true    # Attach exact request params sent to the server
+  raw: true    # Diagnostic copy; secrets and image blocks omitted
 ```
 
 **Check logs:**
