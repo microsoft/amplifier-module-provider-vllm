@@ -295,13 +295,20 @@ async def test_tool_image_parts_reach_sdk_original_call_slot():
     ]
 
 
+@pytest.mark.parametrize("continuation_error", [False, True])
 @pytest.mark.asyncio
-async def test_native_images_and_call_pair_survive_actual_sdk_continuation():
+async def test_native_images_and_call_pair_survive_actual_sdk_continuation(
+    continuation_error, caplog,
+):
     requests = []
 
     async def handler(request):
         sent = json.loads(request.content)
         requests.append(sent)
+        if len(requests) == 2 and continuation_error:
+            return httpx.Response(400, json={"error": {
+                "message": "Bad continuation image", "input": sent["input"],
+            }})
         body = payload("private-served-alias")
         if len(requests) == 1:
             body["status"] = "incomplete"
@@ -333,5 +340,8 @@ async def test_native_images_and_call_pair_survive_actual_sdk_continuation():
     assert requests[1]["input"][0]["content"][1]["image_url"] == DATA_URL
     assert requests[1]["input"][1]["call_id"] == "call_read"
     assert requests[1]["input"][2]["output"][1]["image_url"] == DATA_URL
-    assert result.usage.input_tokens == 20  # Both mocked server usage records.
+    assert result.usage.input_tokens == (10 if continuation_error else 20)
+    if continuation_error:
+        assert result.finish_reason == "length"
+    assert PNG not in caplog.text
     assert messages == original

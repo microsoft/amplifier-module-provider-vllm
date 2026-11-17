@@ -2080,7 +2080,8 @@ class VLLMProvider:
 
                 except Exception as e:
                     logger.error(
-                        f"[PROVIDER] Continuation call {continuation_count} failed: {e}. "
+                        f"[PROVIDER] Continuation call {continuation_count} failed: "
+                        f"{image_error_message(e)}. "
                         f"Returning partial response from {continuation_count} continuation(s)"
                     )
                     break  # Return what we have so far
