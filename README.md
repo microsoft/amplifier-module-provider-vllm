@@ -132,8 +132,18 @@ Local file paths, OpenAI file IDs and malformed sources become explicit
 | User image or mixed text/images | Native ordered message content parts | Generic multimodal Responses path, vision model and chat template |
 | Tool image with `tool_call_id` | Native `function_call_output.output` parts, same call ID/slot | Server SDK supporting list outputs, multimodal parser and tool-aware vision template |
 | Image tool result without call ID | Non-retryable error, no fabricated user turn | Restore original invocation identity upstream |
+| Assistant, system or developer image history | Payload-free `Image unavailable` marker at its text position; no native pixels replayed | No native non-user vision-support claim |
 | Text-only history | Existing serialization unchanged | Existing endpoint requirements |
 | Harmony/GPT-OSS image processing | Not established by this provider | Inspected Harmony path is text-only; no image-support claim |
+
+Non-user image sources (including malformed sources) are not silently dropped or
+serialized as pixels/URLs. Assistant markers stay in assistant `output_text`;
+system markers stay in the existing `instructions` parameter. Image-bearing
+developer messages retain their developer role as text rather than being moved
+to a user message. Neighboring text is retained, and existing assistant
+reasoning/tool-call serialization is unchanged. Text-only developer context-file
+wrapping remains unchanged. Canonical input/history blocks are never rewritten
+by this fallback; it is an honest unavailable result, not native non-user vision.
 
 Actual vLLM source evidence (not just OpenAI API documentation):
 [v0.17.0 Responses serving](https://github.com/vllm-project/vllm/blob/v0.17.0/vllm/entrypoints/openai/responses/serving.py)

@@ -57,7 +57,7 @@ from ._cost import compute_cost
 from ._model_listing import ModelFilters, listing_info
 from ._images import (
     contains_image, image_diagnostic_copy, image_error_message,
-    tool_content_parts, user_content_parts,
+    nonuser_image_content, tool_content_parts, user_content_parts,
 )
 from ._response_handling import usage_from_response, validate_function_completion
 from ._response_handling import convert_response_with_accumulated_output
@@ -1368,7 +1368,10 @@ class VLLMProvider:
         # Combine system messages as instructions
         instructions = (
             "\n\n".join(
-                m.content if isinstance(m.content, str) else "" for m in system_msgs
+                self._extract_text_from_content(nonuser_image_content(m.content, "system"))
+                if contains_image(m.content)
+                else (m.content if isinstance(m.content, str) else "")
+                for m in system_msgs
             )
             if system_msgs
             else None
@@ -2332,6 +2335,7 @@ class VLLMProvider:
 
             # Handle assistant messages
             if role == "assistant":
+                content = nonuser_image_content(content, "assistant")
                 reasoning_items_to_add = []  # Top-level reasoning items (before assistant message)
                 function_call_items = []  # Top-level function_call items (for tool calls)
                 text_parts = []  # Accumulate text for simple string content
@@ -2494,9 +2498,17 @@ class VLLMProvider:
 
             # Handle developer messages as XML-wrapped user messages
             elif role == "developer":
-                text_content = self._extract_text_from_content(content)
-                wrapped = f"<context_file>\n{text_content}\n</context_file>"
-                openai_messages.append({"role": "user", "content": wrapped})
+                if contains_image(content):
+                    # Do not relocate unsupported developer images to a user.
+                    text_content = self._extract_text_from_content(
+                        nonuser_image_content(content, "developer")
+                    )
+                    openai_messages.append({"role": "developer", "content": text_content})
+                else:
+                    # Preserve the established text-only context-file policy.
+                    text_content = self._extract_text_from_content(content)
+                    wrapped = f"<context_file>\n{text_content}\n</context_file>"
+                    openai_messages.append({"role": "user", "content": wrapped})
                 i += 1
 
             # Handle user messages

@@ -16,6 +16,29 @@ def _mapping(block: Any) -> Any:
     return block.model_dump() if hasattr(block, "model_dump") else block
 
 
+def nonuser_image_content(content: Any, role: str) -> Any:
+    """Replace unsupported non-user image blocks, never their source history.
+
+    Native image replay is qualified only for user/tool input. Keep a text
+    marker at each image position without inspecting or echoing its source.
+    Other blocks remain untouched for the existing role/reasoning serializer.
+    """
+    if not isinstance(content, list):
+        return content
+    result = []
+    for block in content:
+        value = _mapping(block)
+        if isinstance(value, Mapping) and value.get("type") in IMAGE_TYPES:
+            result.append({
+                "type": "text",
+                "text": f"[Image unavailable: native image replay is not supported "
+                        f"by this provider in {role} content.]",
+            })
+        else:
+            result.append(block)
+    return result
+
+
 def contains_image(value: Any) -> bool:
     """Recognize structured image blocks, never inspect/stringify pixel data."""
     value = _mapping(value)
