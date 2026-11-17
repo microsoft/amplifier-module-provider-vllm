@@ -55,6 +55,10 @@ from ._constants import METADATA_RESPONSE_ID
 from ._constants import METADATA_STATUS
 from ._cost import compute_cost
 from ._model_listing import ModelFilters, listing_info
+from ._images import (
+    contains_image, image_diagnostic_copy, image_error_message,
+    tool_content_parts, user_content_parts,
+)
 from ._response_handling import usage_from_response, validate_function_completion
 from ._response_handling import convert_response_with_accumulated_output
 from ._token_accounting import apply_token_accounting
@@ -1521,7 +1525,7 @@ class VLLMProvider:
                 "thinking_enabled": thinking_enabled,
             }
             if self.raw:
-                request_payload["raw"] = redact_secrets(params)
+                request_payload["raw"] = redact_secrets(image_diagnostic_copy(params))
             await self.coordinator.hooks.emit("llm:request", request_payload)
 
         start_time = time.time()
@@ -1710,8 +1714,7 @@ class VLLMProvider:
                     and retry_after > self._retry_config.max_delay
                 ):
                     retryable = False
-                body = getattr(e, "body", None)
-                msg = json.dumps(body) if body is not None else str(e)
+                msg = image_error_message(e)
                 raise kernel_errors.RateLimitError(
                     msg,
                     provider=self.name,
@@ -1720,8 +1723,7 @@ class VLLMProvider:
                     retry_after=retry_after,
                 ) from e
             except openai.AuthenticationError as e:
-                body = getattr(e, "body", None)
-                msg = json.dumps(body) if body is not None else str(e)
+                msg = image_error_message(e)
                 raise kernel_errors.AuthenticationError(
                     msg,
                     provider=self.name,
@@ -1729,8 +1731,7 @@ class VLLMProvider:
                 ) from e
             except openai.BadRequestError as e:
                 raw_msg = str(e).lower()
-                body = getattr(e, "body", None)
-                error_msg = json.dumps(body) if body is not None else str(e)
+                error_msg = image_error_message(e)
                 if (
                     "context length" in raw_msg
                     or "too many tokens" in raw_msg
@@ -1759,8 +1760,7 @@ class VLLMProvider:
                     ) from e
             except openai.APIStatusError as e:
                 status = getattr(e, "status_code", 500)
-                body = getattr(e, "body", None)
-                error_msg = json.dumps(body) if body is not None else str(e)
+                error_msg = image_error_message(e)
                 if status == 403:
                     if self._is_cloudflare_challenge(e):
                         logger.warning(
@@ -1822,12 +1822,7 @@ class VLLMProvider:
             except kernel_errors.LLMError:
                 raise  # Already translated, don't double-wrap
             except Exception as e:
-                body = getattr(e, "body", None)
-                error_msg = (
-                    json.dumps(body)
-                    if body is not None
-                    else (str(e) or f"{type(e).__name__}: (no message)")
-                )
+                error_msg = image_error_message(e) or f"{type(e).__name__}: (no message)"
                 raise kernel_errors.LLMError(
                     error_msg,
                     provider=self.name,
@@ -1914,7 +1909,7 @@ class VLLMProvider:
 
                 # Build continuation params using input-based pattern (stateless-compatible)
                 continuation_input = self._build_continuation_input(
-                    all_messages_for_conversion, accumulated_output
+                    input_messages, accumulated_output
                 )
 
                 continue_params = {
@@ -2170,7 +2165,9 @@ class VLLMProvider:
                     else None,
                 }
                 if self.raw:
-                    response_event["raw"] = redact_secrets(response.model_dump())
+                    response_event["raw"] = redact_secrets(
+                        image_diagnostic_copy(response.model_dump())
+                    )
                 await self.coordinator.hooks.emit("llm:response", response_event)
 
             return chat_response
@@ -2247,7 +2244,7 @@ class VLLMProvider:
         """Convert messages to vLLM Responses API format (OpenAI-compatible).
 
         Handles:
-        - User messages: Simple string content
+        - User messages: Text or ordered native input_text/input_image parts
         - Assistant messages: Simple string content with tool calls as function_call items
         - Tool messages: Native function_call_output format for explicit correlation
 
@@ -2277,6 +2274,30 @@ class VLLMProvider:
                     tool_call_id = tool_msg.get("tool_call_id")
                     tool_content = tool_msg.get("content", "")
                     tool_name = tool_msg.get("tool_name", "unknown")
+
+                    if contains_image(tool_content):
+                        if not tool_call_id:
+                            raise kernel_errors.InvalidRequestError(
+                                "Image tool result requires tool_call_id; "
+                                "cannot relocate it into a user message.",
+                                provider=self.name,
+                            )
+                        # Generic vLLM Responses processing preserves output
+                        # parts as tool content for its multimodal parser.
+                        # Server SDK/model/template support remains required.
+                        try:
+                            output_parts = tool_content_parts(tool_content, tool_call_id)
+                        except ValueError as error:
+                            raise kernel_errors.InvalidRequestError(
+                                str(error), provider=self.name,
+                            ) from None
+                        openai_messages.append({
+                            "type": "function_call_output",
+                            "call_id": tool_call_id,
+                            "output": output_parts,
+                        })
+                        i += 1
+                        continue
 
                     if tool_call_id:
                         # Native format: function_call_output with call_id for explicit correlation
@@ -2479,10 +2500,15 @@ class VLLMProvider:
 
             # Handle user messages
             elif role == "user":
-                # Extract text content as simple string
-                text_content = self._extract_text_from_content(content)
-                if text_content:
-                    openai_messages.append({"role": "user", "content": text_content})
+                if isinstance(content, list) and contains_image(content):
+                    openai_messages.append({
+                        "role": "user", "content": user_content_parts(content),
+                    })
+                else:
+                    # Preserve the established text-only wire shape.
+                    text_content = self._extract_text_from_content(content)
+                    if text_content:
+                        openai_messages.append({"role": "user", "content": text_content})
                 i += 1
             else:
                 # Unknown role - skip

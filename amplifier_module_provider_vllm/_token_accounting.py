@@ -28,6 +28,8 @@ from openai_harmony import Role
 from openai_harmony import SystemContent
 from openai_harmony import load_harmony_encoding
 
+from ._images import contains_image
+
 logger = logging.getLogger(__name__)
 
 # Global Harmony encoder (loaded once per process)
@@ -210,6 +212,13 @@ def compute_input_tokens(params: dict[str, Any]) -> int:
     Returns:
         Number of input tokens (accurate), or 0 if encoder unavailable
     """
+    if contains_image(params.get("input", [])):
+        logger.warning(
+            "[TOKEN_ACCOUNTING] Image input token count is unavailable from "
+            "the text-only Harmony estimator."
+        )
+        return 0
+
     try:
         encoding = _get_harmony_encoding()
         if encoding is None:
@@ -415,6 +424,13 @@ def apply_token_accounting(params: dict[str, Any], response: Any) -> Any:
         Response object with corrected usage values
     """
     logger.debug("[TOKEN_ACCOUNTING] Applying token accounting for GPT-OSS model")
+
+    if contains_image(params.get("input", [])):
+        logger.warning(
+            "[TOKEN_ACCOUNTING] Corrected accounting is unavailable for image "
+            "inputs; preserving server usage (zero/missing remains unknown)."
+        )
+        return response
 
     # Compute input tokens (accurate)
     input_tokens = compute_input_tokens(params)
