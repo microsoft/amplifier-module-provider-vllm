@@ -213,3 +213,54 @@ async def test_nonuser_images_actual_sdk_payload_and_plaintext_reuse(role, sourc
     assert_no_pixels(events)
     assert_no_pixels(caplog.text)
     assert messages == original
+
+
+@pytest.mark.parametrize("role", ["system", "developer"])
+@pytest.mark.asyncio
+async def test_business_image_tags_do_not_change_nonuser_policy_actual_sdk(role):
+    """Nested asset tags are ordinary data, not top-level content blocks."""
+    requests = []
+    business = {"asset": {"type": "image", "label": "business record only"}}
+    contents = [
+        [TextBlock(text="ordinary context text", metadata=business)],
+        [{"type": "text", "text": "ordinary context text", "metadata": business}],
+        [
+            TextBlock(text="ordinary context text"),
+            ToolCallBlock(id="call_business", name="catalog", input=business),
+        ],
+    ]
+
+    async def handler(request):
+        requests.append(json.loads(request.content))
+        return httpx.Response(200, json=payload("private-served-alias"))
+
+    async with (
+        httpx.AsyncClient(transport=httpx.MockTransport(handler)) as transport,
+        openai.AsyncOpenAI(api_key="fixture", base_url="http://vllm.invalid/v1",
+                           http_client=transport, max_retries=0) as client,
+    ):
+        instance = VLLMProvider(client=client, config={
+            "default_model": "private-served-alias", "use_streaming": False,
+            "max_retries": 0,
+        })
+        for content in contents:
+            messages = [
+                Message(role=role, content=content),
+                Message(role="user", content="followup"),
+            ]
+            original = copy.deepcopy(messages)
+            await instance.complete(ChatRequest(messages=messages))
+            assert messages == original
+    assert len(requests) == 3
+    for sent in requests:
+        if role == "developer":
+            assert sent["input"] == [
+                {"role": "user", "content": "<context_file>\nordinary context text\n</context_file>"},
+                {"role": "user", "content": "followup"},
+            ]
+        else:
+            # Preserve accepted pre-existing structured text-only system policy.
+            assert "instructions" not in sent
+            assert sent["input"] == [{"role": "user", "content": "followup"}]
+        assert "image unavailable" not in json.dumps(sent).lower()
+        assert_no_pixels(sent)

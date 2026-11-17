@@ -56,7 +56,7 @@ from ._constants import METADATA_STATUS
 from ._cost import compute_cost
 from ._model_listing import ModelFilters, listing_info
 from ._images import (
-    contains_image, image_diagnostic_copy, image_error_message,
+    contains_image, has_direct_image, image_diagnostic_copy, image_error_message,
     nonuser_image_content, tool_content_parts, user_content_parts,
 )
 from ._response_handling import usage_from_response, validate_function_completion
@@ -1369,7 +1369,7 @@ class VLLMProvider:
         instructions = (
             "\n\n".join(
                 self._extract_text_from_content(nonuser_image_content(m.content, "system"))
-                if contains_image(m.content)
+                if has_direct_image(m.content)
                 else (m.content if isinstance(m.content, str) else "")
                 for m in system_msgs
             )
@@ -2498,7 +2498,7 @@ class VLLMProvider:
 
             # Handle developer messages as XML-wrapped user messages
             elif role == "developer":
-                if contains_image(content):
+                if has_direct_image(content):
                     # Do not relocate unsupported developer images to a user.
                     text_content = self._extract_text_from_content(
                         nonuser_image_content(content, "developer")

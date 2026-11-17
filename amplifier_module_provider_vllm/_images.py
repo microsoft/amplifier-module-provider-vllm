@@ -16,6 +16,21 @@ def _mapping(block: Any) -> Any:
     return block.model_dump() if hasattr(block, "model_dump") else block
 
 
+def has_direct_image(content: Any) -> bool:
+    """Match only content blocks handled by nonuser_image_content.
+
+    Image-like tags nested in text extras or tool arguments are business data,
+    not a reason to change a message's role or instructions policy.
+    """
+    if not isinstance(content, list):
+        return False
+    return any(
+        isinstance(value := _mapping(block), Mapping)
+        and value.get("type") in IMAGE_TYPES
+        for block in content
+    )
+
+
 def nonuser_image_content(content: Any, role: str) -> Any:
     """Replace unsupported non-user image blocks, never their source history.
 
