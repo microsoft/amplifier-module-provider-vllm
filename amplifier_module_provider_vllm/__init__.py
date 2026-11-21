@@ -56,7 +56,7 @@ from ._constants import METADATA_STATUS
 from ._cost import compute_cost
 from ._model_listing import ModelFilters, listing_info
 from ._images import (
-    contains_image, has_direct_image, image_diagnostic_copy, image_error_message,
+    ImageDiagnostics, contains_image, has_direct_image,
     nonuser_image_content, tool_content_parts, user_content_parts,
 )
 from ._response_handling import usage_from_response, validate_function_completion
@@ -1517,6 +1517,8 @@ class VLLMProvider:
         if self.extra_request_params:
             params.update(self.extra_request_params)
 
+        diagnostics = ImageDiagnostics(params)
+
         # Emit llm:request event
         if self.coordinator and hasattr(self.coordinator, "hooks"):
             request_payload: dict[str, Any] = {
@@ -1528,7 +1530,7 @@ class VLLMProvider:
                 "thinking_enabled": thinking_enabled,
             }
             if self.raw:
-                request_payload["raw"] = redact_secrets(image_diagnostic_copy(params))
+                request_payload["raw"] = redact_secrets(diagnostics.copy(params))
             await self.coordinator.hooks.emit("llm:request", request_payload)
 
         start_time = time.time()
@@ -1687,7 +1689,7 @@ class VLLMProvider:
                                     "request_id": request_id,
                                     "error": {
                                         "type": type(e).__name__,
-                                        "msg": str(e),
+                                        "msg": diagnostics.error_message(e),
                                     },
                                 },
                             )
@@ -1717,7 +1719,7 @@ class VLLMProvider:
                     and retry_after > self._retry_config.max_delay
                 ):
                     retryable = False
-                msg = image_error_message(e)
+                msg = diagnostics.error_message(e)
                 raise kernel_errors.RateLimitError(
                     msg,
                     provider=self.name,
@@ -1726,7 +1728,7 @@ class VLLMProvider:
                     retry_after=retry_after,
                 ) from e
             except openai.AuthenticationError as e:
-                msg = image_error_message(e)
+                msg = diagnostics.error_message(e)
                 raise kernel_errors.AuthenticationError(
                     msg,
                     provider=self.name,
@@ -1734,7 +1736,7 @@ class VLLMProvider:
                 ) from e
             except openai.BadRequestError as e:
                 raw_msg = str(e).lower()
-                error_msg = image_error_message(e)
+                error_msg = diagnostics.error_message(e)
                 if (
                     "context length" in raw_msg
                     or "too many tokens" in raw_msg
@@ -1763,7 +1765,7 @@ class VLLMProvider:
                     ) from e
             except openai.APIStatusError as e:
                 status = getattr(e, "status_code", 500)
-                error_msg = image_error_message(e)
+                error_msg = diagnostics.error_message(e)
                 if status == 403:
                     if self._is_cloudflare_challenge(e):
                         logger.warning(
@@ -1825,12 +1827,19 @@ class VLLMProvider:
             except kernel_errors.LLMError:
                 raise  # Already translated, don't double-wrap
             except Exception as e:
-                error_msg = image_error_message(e) or f"{type(e).__name__}: (no message)"
+                error_msg = diagnostics.error_message(e) or f"{type(e).__name__}: (no message)"
                 raise kernel_errors.LLMError(
                     error_msg,
                     provider=self.name,
                     retryable=True,
                 ) from e
+
+        async def _attempt():
+            try:
+                return await _do_complete()
+            except kernel_errors.LLMError as error:
+                diagnostics.clean_exception(error)
+                raise
 
         async def _on_retry(attempt: int, delay: float, error: kernel_errors.LLMError):
             """Callback invoked before each retry sleep."""
@@ -1849,7 +1858,7 @@ class VLLMProvider:
 
         try:
             response = await retry_with_backoff(
-                _do_complete,
+                _attempt,
                 self._retry_config,
                 on_retry=_on_retry,
             )
@@ -2084,7 +2093,7 @@ class VLLMProvider:
                 except Exception as e:
                     logger.error(
                         f"[PROVIDER] Continuation call {continuation_count} failed: "
-                        f"{image_error_message(e)}. "
+                        f"{diagnostics.error_message(e)}. "
                         f"Returning partial response from {continuation_count} continuation(s)"
                     )
                     break  # Return what we have so far
@@ -2170,13 +2179,14 @@ class VLLMProvider:
                 }
                 if self.raw:
                     response_event["raw"] = redact_secrets(
-                        image_diagnostic_copy(response.model_dump())
+                        diagnostics.copy(response.model_dump())
                     )
                 await self.coordinator.hooks.emit("llm:response", response_event)
 
             return chat_response
 
         except kernel_errors.LLMError as e:
+            diagnostics.clean_exception(e)
             elapsed_ms = int((time.time() - start_time) * 1000)
             logger.error("[PROVIDER] %s API error: %s", self.api_label, str(e))
 
@@ -2197,7 +2207,7 @@ class VLLMProvider:
         except Exception as e:
             elapsed_ms = int((time.time() - start_time) * 1000)
             # Ensure error message is never empty
-            error_msg = str(e) or f"{type(e).__name__}: (no message)"
+            error_msg = diagnostics.error_message(e) or f"{type(e).__name__}: (no message)"
             logger.error("[PROVIDER] %s API error: %s", self.api_label, error_msg)
 
             # Emit error event
@@ -2212,7 +2222,11 @@ class VLLMProvider:
                         "model": params["model"],
                     },
                 )
-            raise
+            if not diagnostics.images:
+                raise
+            # Conversion failures can retain raw SDK inputs as attributes.
+            error = kernel_errors.LLMError(error_msg, provider=self.name)
+        raise error from None
 
     def _extract_text_from_content(self, content: Any) -> str:
         """Extract plain text from content (handles both string and structured formats).
