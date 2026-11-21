@@ -345,3 +345,71 @@ async def test_native_images_and_call_pair_survive_actual_sdk_continuation(
         assert result.finish_reason == "length"
     assert PNG not in caplog.text
     assert messages == original
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw", [False, True])
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_echoed_pixels_and_escaped_signed_url_private_in_all_errors(caplog, raw, streaming):
+    import traceback
+
+    url = "https://images.invalid/café.png?sig=fixture-private-signature"
+    events = []
+    attempts = []
+
+    async def emit(event, data):
+        events.append((event, copy.deepcopy(data)))
+
+    async def handler(request):
+        parts = json.loads(request.content)["input"][0]["content"]
+        assert [p["image_url"] for p in parts] == [DATA_URL, url]
+        attempts.append(request.url.path)
+        # A backend can include a serialized string inline in its own error.
+        echoed_url = json.dumps(url).replace("/", r"\/")
+        return httpx.Response(429 if len(attempts) == 1 else 400, json={"error": {
+            "message": f"image validation failed for {PNG} and {echoed_url}",
+        }})
+
+    req = ChatRequest(messages=[Message(role="user", content=[
+        image(), image({"type": "url", "url": url})
+    ])])
+    before = req.model_dump()
+    async with (
+        httpx.AsyncClient(transport=httpx.MockTransport(handler)) as transport,
+        openai.AsyncOpenAI(api_key="fixture", base_url="http://vllm.invalid/v1",
+                           http_client=transport, max_retries=0) as client,
+    ):
+        instance = VLLMProvider(client=client, config={
+            "raw": raw, "use_streaming": streaming, "max_retries": 1, "min_retry_delay": 0.001,
+        })
+        instance.coordinator = SimpleNamespace(hooks=SimpleNamespace(emit=emit))
+        with pytest.raises(InvalidRequestError) as caught:
+            await instance.complete(req)
+    assert len(attempts) == 2
+    assert any(name == "provider:retry" for name, _ in events)
+    assert caught.value.status_code == 400 and not caught.value.retryable
+    assert "image validation failed" in str(caught.value)
+    visible = "".join(traceback.format_exception(caught.value)) + caplog.text + repr(events)
+    assert PNG not in visible and "fixture-private-signature" not in visible
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+    assert req.model_dump() == before
+
+
+def test_url_spellings_computed_once_across_long_diagnostics(monkeypatch):
+    from amplifier_module_provider_vllm import _images
+
+    url = "https://images.invalid/café.png?sig=fixture"
+    encoded = json.dumps(url)[1:-1]
+    dumps = []
+
+    def count(value, **kwargs):
+        dumps.append(value)
+        return json.dumps(value, **kwargs)
+
+    monkeypatch.setattr(_images, "json", SimpleNamespace(dumps=count))
+    params = {"input": [{"content": "plain text"} for _ in range(800)]}
+    params["input"].extend([{"type": "input_image", "image_url": url}] * 2)
+    diagnostic = _images.ImageDiagnostics(params)
+    diagnostic.copy(params)
+    assert "fixture" not in diagnostic.copy(encoded)
+    assert len(dumps) <= 2 and all(value == url for value in dumps)
+    assert _images.ImageDiagnostics({}).copy(url) == url

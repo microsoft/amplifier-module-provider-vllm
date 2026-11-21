@@ -5,6 +5,7 @@ import binascii
 import json
 import re
 from collections.abc import Mapping
+from functools import cached_property
 from typing import Any
 from urllib.parse import urlparse
 
@@ -148,25 +149,69 @@ def tool_content_parts(content: Any, call_id: str) -> list[dict[str, Any]]:
     return parts
 
 
-def image_diagnostic_copy(value: Any) -> Any:
-    """Copy diagnostics, replacing entire image blocks (including signed URLs).
-
-    This is structured-media redaction, not general arbitrary-text redaction.
-    Secret-key redaction is applied separately by the Core utility.
-    """
-    value = _mapping(value)
+def _submitted_image_urls(value):
     if isinstance(value, Mapping):
-        if value.get("type") in IMAGE_TYPES:
-            return {"type": value["type"], "redacted": "[image omitted]"}
-        return {key: image_diagnostic_copy(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [image_diagnostic_copy(item) for item in value]
-    return value
+        if value.get("type") == "input_image":
+            url = value.get("image_url")
+            if isinstance(url, str) and url:
+                yield url
+                if url.startswith("data:"):
+                    payload = url.partition(",")[2]
+                    if payload:
+                        yield payload
+        else:
+            for child in value.values():
+                yield from _submitted_image_urls(child)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _submitted_image_urls(item)
 
 
-def image_error_message(error: Exception) -> str:
-    """Keep error category/metadata without echoing server image validation input."""
-    body = getattr(error, "body", None)
-    if body is None:
-        return str(error)
-    return json.dumps(image_diagnostic_copy(body))
+class ImageDiagnostics:
+    """Keep the exact submitted image echoes scoped to one Responses request."""
+
+    def __init__(self, params):
+        self.images = set(_submitted_image_urls(params))
+
+    @cached_property
+    def patterns(self):
+        variants = set(self.images)
+        for image in self.images:
+            # Plain ASCII data URLs/base64 have identical JSON string contents.
+            if image.isascii() and not any(ch in image for ch in ('"', '\\')) and image.isprintable():
+                continue
+            for ascii_only in (True, False):
+                variants.add(json.dumps(image, ensure_ascii=ascii_only)[1:-1])
+        # JSON also permits escaped forward slashes, including inside base64.
+        variants |= {value.replace("/", r"\/") for value in variants}
+        return sorted(variants, key=len, reverse=True)
+
+    def copy(self, value: Any) -> Any:
+        value = _mapping(value)
+        if isinstance(value, Mapping):
+            if value.get("type") in IMAGE_TYPES:
+                return {"type": value["type"], "redacted": "[image omitted]"}
+            return {key: self.copy(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [self.copy(item) for item in value]
+        if isinstance(value, str):
+            for pattern in self.patterns:
+                value = value.replace(pattern, "[image omitted]")
+        return value
+
+    def clean_exception(self, error: Exception) -> None:
+        if self.images:
+            # SDK causes can hold the entire outgoing HTTP request.
+            error.args = tuple(self.copy(arg) for arg in error.args)
+            error.__cause__ = error.__context__ = None
+
+    def error_message(self, error: Exception) -> str:
+        body = getattr(error, "body", None)
+        if body is None:
+            return self.copy(str(error))
+        # Remove any JSON-escaped URL in a field before serializing the body.
+        return json.dumps(self.copy(body))
+
+
+def image_diagnostic_copy(value: Any) -> Any:
+    return ImageDiagnostics(value).copy(value)
